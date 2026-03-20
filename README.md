@@ -2,6 +2,8 @@
 
 Tamper-proof audit trail for AI decisions. Record, verify, and export cryptographic proof chains via MCP.
 
+[![cronozen-proof MCP server](https://glama.ai/mcp/servers/cronozen/mcp-server/badges/card.svg)](https://glama.ai/mcp/servers/cronozen/mcp-server)
+
 ## Overview
 
 This MCP server exposes 6 tools for AI decision provenance — recording decisions, verifying cryptographic integrity, and exporting audit-ready evidence. AI clients such as Claude Desktop connect over **Streamable HTTP** transport and interact with decision proofs through a standard MCP interface.
