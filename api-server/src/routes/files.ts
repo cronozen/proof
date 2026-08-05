@@ -18,6 +18,8 @@
 import { Hono } from 'hono';
 import { getDB } from '../db/connection.js';
 import { computeChainHash } from '@cronozen/dpu-core';
+import { CHAIN_PAYLOAD_VERSION, buildChainContentV3 } from '../lib/chain-content.js';
+import { signRecord } from '../lib/signing.js';
 import type { AuthContext } from '../middleware/auth.js';
 import type { QuotaInfo } from '../middleware/quota.js';
 import { calculateExpiresAt, checkStorageLimit } from '../services/retention.js';
@@ -125,11 +127,65 @@ filesRouter.post('/upload', async (c) => {
   const previousHash = lastInChain?.chain_hash || null;
   const chainIndex = (lastInChain?.chain_index ?? -1) + 1;
 
+  // 🔑 컬럼값을 먼저 확정 → 그 객체에서 해시. 검증기가 DB 행을 같은 빌더에 넣는다.
+  //    파일 이벤트는 file_hash가 action_metadata 안에 들어가므로 그 JSON 문자열이 해시에 묶인다.
+  const eventCols = {
+    id: eventId,
+    decision_id: decisionId,
+    type: 'file_change',
+    source_type: 'manual',
+    status: 'recorded',
+
+    actor_id: auth.tenantId,
+    actor_type: 'human',
+    actor_name: null,
+    actor_metadata: null,
+
+    action_type: 'UPLOAD',
+    action_description: description || `File uploaded: ${file.name}`,
+    action_input: null,
+    action_output: null,
+    action_metadata: JSON.stringify({
+      fileId,
+      filename: file.name,
+      fileHash,
+      sizeBytes: buffer.length,
+      mimeType: file.type,
+      version: versionNumber,
+    }),
+
+    ai_model: null,
+    ai_provider: null,
+    ai_confidence: null,
+    ai_prompt_hash: null,
+    ai_reasoning: null,
+    ai_tokens_input: null,
+    ai_tokens_output: null,
+    ai_metadata: null,
+
+    evidence_id: evidenceId,
+    evidence_level: 'DRAFT',
+    chain_index: chainIndex,
+    previous_hash: previousHash,
+    chain_domain: domain,
+
+    occurred_at: now,
+    tags: JSON.stringify(['file', 'upload']),
+    metadata: JSON.stringify({ domain, fileId }),
+
+    tenant_id: auth.tenantId,
+    api_key_id: auth.apiKeyId,
+    created_at: now,
+    updated_at: now,
+  };
+
   const chainHash = computeChainHash(
-    { type: 'file_change', action_type: 'UPLOAD', actor_id: auth.tenantId, file_hash: fileHash },
+    buildChainContentV3(eventCols),
     previousHash,
-    now,
+    eventCols.occurred_at,
   );
+
+  const sig = signRecord(chainHash, null);
 
   // diff 요약 (이전 버전이 있으면)
   const diffSummary = previousVersion
@@ -156,18 +212,24 @@ filesRouter.post('/upload', async (c) => {
   const insertEvent = db.prepare(`
     INSERT INTO decision_events (
       id, decision_id, type, source_type, status,
-      actor_id, actor_type,
-      action_type, action_description, action_metadata,
+      actor_id, actor_type, actor_name, actor_metadata,
+      action_type, action_description, action_input, action_output, action_metadata,
+      ai_model, ai_provider, ai_confidence, ai_prompt_hash, ai_reasoning,
+      ai_tokens_input, ai_tokens_output, ai_metadata,
       evidence_id, evidence_level, chain_hash, chain_index, previous_hash, chain_domain,
+      chain_payload_version, signature, signature_alg, signature_key_id,
       occurred_at, tags, metadata,
       tenant_id, api_key_id, created_at, updated_at
     ) VALUES (
-      ?, ?, 'file_change', 'manual', 'recorded',
-      ?, 'human',
-      'UPLOAD', ?, ?,
-      ?, 'DRAFT', ?, ?, ?, ?,
-      ?, ?, ?,
-      ?, ?, ?, ?
+      @id, @decision_id, @type, @source_type, @status,
+      @actor_id, @actor_type, @actor_name, @actor_metadata,
+      @action_type, @action_description, @action_input, @action_output, @action_metadata,
+      @ai_model, @ai_provider, @ai_confidence, @ai_prompt_hash, @ai_reasoning,
+      @ai_tokens_input, @ai_tokens_output, @ai_metadata,
+      @evidence_id, @evidence_level, @chain_hash, @chain_index, @previous_hash, @chain_domain,
+      @chain_payload_version, @signature, @signature_alg, @signature_key_id,
+      @occurred_at, @tags, @metadata,
+      @tenant_id, @api_key_id, @created_at, @updated_at
     )
   `);
 
@@ -180,24 +242,14 @@ filesRouter.post('/upload', async (c) => {
       now,
     );
 
-    insertEvent.run(
-      eventId, decisionId,
-      auth.tenantId,
-      description || `File uploaded: ${file.name}`,
-      JSON.stringify({
-        fileId,
-        filename: file.name,
-        fileHash,
-        sizeBytes: buffer.length,
-        mimeType: file.type,
-        version: versionNumber,
-      }),
-      evidenceId, chainHash, chainIndex, previousHash, domain,
-      now,
-      JSON.stringify(['file', 'upload']),
-      JSON.stringify({ domain, fileId }),
-      auth.tenantId, auth.apiKeyId, now, now,
-    );
+    insertEvent.run({
+      ...eventCols,
+      chain_hash: chainHash,
+      chain_payload_version: CHAIN_PAYLOAD_VERSION,
+      signature: sig?.signature ?? null,
+      signature_alg: sig?.alg ?? null,
+      signature_key_id: sig?.keyId ?? null,
+    });
   });
 
   transaction();

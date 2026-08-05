@@ -1,7 +1,7 @@
 /**
- * Cronozen Proof Cloud API — MVP
+ * Cronozen Proof Cloud API — 부팅
  *
- * SDK가 연결하는 최소 API 서버.
+ * 라우트 정의는 app.ts. 이 파일은 포트를 잡고, 초기 키를 만들고, 상태를 로그로 말한다.
  *
  * Endpoints:
  *   POST   /decision-events
@@ -10,6 +10,8 @@
  *   POST   /decision-events/:id/approvals
  *   GET    /evidence/:id
  *   GET    /evidence/:id/export
+ *   GET    /verify/:id            — 공개 검증 (해시 재계산 + 체인 연결 + 봉인 + 서명)
+ *   GET    /verify/public-key     — 검증용 공개키
  *
  * Auth: Bearer token (API key)
  * Storage: SQLite (MVP) → PostgreSQL (prod)
@@ -18,107 +20,11 @@
  * @version 0.1.0
  */
 
-import { Hono } from 'hono';
-import { cors } from 'hono/cors';
-import { logger } from 'hono/logger';
 import { serve } from '@hono/node-server';
-import { authMiddleware, createApiKey } from './middleware/auth.js';
-import { quotaMiddleware } from './middleware/quota.js';
-import { decisionsRouter } from './routes/decisions.js';
-import { evidenceRouter } from './routes/evidence.js';
-import { filesRouter } from './routes/files.js';
-import { integrationsRouter, webhooksRouter } from './routes/integrations.js';
+import { app } from './app.js';
+import { createApiKey } from './middleware/auth.js';
 import { getDB } from './db/connection.js';
-
-const app = new Hono();
-
-// ─── Global Middleware ─────────────────────────────────────────────
-
-app.use('*', cors());
-app.use('*', logger());
-
-// ─── Root + Health Check (unauthenticated) ─────────────────────────
-
-app.get('/', (c) => {
-  return c.json({
-    name: 'Cronozen Proof API',
-    version: '0.1.0',
-    docs: 'https://github.com/cronozen/proof',
-    endpoints: {
-      health: '/health',
-      decisions: '/decision-events',
-      evidence: '/evidence/:id',
-      files: '/files/upload',
-      integrations: '/integrations/google-drive/connect',
-      webhooks: '/webhooks/google-drive',
-      verify: '/verify/:id',
-    },
-  });
-});
-
-app.get('/health', (c) => {
-  return c.json({
-    status: 'ok',
-    version: '0.1.0',
-    timestamp: new Date().toISOString(),
-  });
-});
-
-// ─── Webhooks (unauthenticated — external services call directly) ──
-
-app.route('/webhooks', webhooksRouter);
-
-// ─── Public Verification (unauthenticated) ─────────────────────────
-
-app.get('/verify/:id', (c) => {
-  const id = c.req.param('id');
-  const db = getDB();
-
-  const row = db
-    .prepare('SELECT evidence_id, decision_id, chain_hash, chain_index, previous_hash, chain_domain, sealed_at, evidence_level FROM decision_events WHERE evidence_id = ? OR id = ?')
-    .get(id, id) as Record<string, unknown> | undefined;
-
-  if (!row) {
-    return c.json({ verified: false, error: 'Evidence not found' }, 404);
-  }
-
-  return c.json({
-    verified: !!row.sealed_at,
-    evidence: {
-      id: row.evidence_id || id,
-      decisionId: row.decision_id,
-      evidenceLevel: row.evidence_level,
-      chain: {
-        hash: row.chain_hash,
-        index: row.chain_index,
-        previousHash: row.previous_hash,
-        domain: row.chain_domain,
-      },
-      sealedAt: row.sealed_at || null,
-    },
-  });
-});
-
-// ─── Authenticated Routes ──────────────────────────────────────────
-
-app.use('/decision-events/*', authMiddleware);
-app.use('/decision-events/*', quotaMiddleware());
-app.use('/evidence/*', authMiddleware);
-app.use('/files/*', authMiddleware);
-app.use('/files/*', quotaMiddleware());
-// OAuth callback은 인증 불필요 (Google이 리다이렉트) — 나머지는 인증 필요
-app.use('/integrations/google-drive/connect', authMiddleware);
-app.use('/integrations/google-drive/folders', authMiddleware);
-app.use('/integrations/google-drive/watch', authMiddleware);
-app.use('/integrations/google-drive/disconnect', authMiddleware);
-app.use('/integrations/status', authMiddleware);
-
-app.route('/decision-events', decisionsRouter);
-app.route('/evidence', evidenceRouter);
-app.route('/files', filesRouter);
-app.route('/integrations', integrationsRouter);
-
-// ─── Bootstrap ─────────────────────────────────────────────────────
+import { getSigner } from './lib/signing.js';
 
 const port = parseInt(process.env.PORT || '3200');
 
@@ -138,9 +44,20 @@ if (hasKeys.count === 0) {
   console.log('');
 }
 
+// 서명 상태를 부팅 로그에 소리내어 말한다.
+// "서명하고 있다고 믿었는데 안 하고 있었다"가 이 조직에서 반복된 실패 방식이다.
+const signer = getSigner();
+if (signer) {
+  console.log(`Server signature: ACTIVE (Ed25519, keyId=${signer.keyId})`);
+} else {
+  console.log('Server signature: NOT CONFIGURED — records are verified by hash chain only.');
+  console.log('  → Generate a key: npm run keygen --workspace=api-server');
+}
+
 serve({ fetch: app.fetch, port }, () => {
   console.log(`Cronozen Proof API running on http://localhost:${port}`);
   console.log(`Health: http://localhost:${port}/health`);
+  console.log(`Verify: http://localhost:${port}/verify/:id`);
 });
 
 export default app;

@@ -9,6 +9,8 @@
     "build": "tsup src/index.ts --format esm --dts --clean",
     "start": "node dist/index.js",
     "db:init": "tsx src/db/init.ts",
+    "keygen": "tsx src/scripts/generate-signing-key.ts",
+    "test": "tsx --test src/__tests__/*.test.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

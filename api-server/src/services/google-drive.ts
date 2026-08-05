@@ -15,6 +15,8 @@
 import { google, type drive_v3 } from 'googleapis';
 import { getDB } from '../db/connection.js';
 import { computeChainHash } from '@cronozen/dpu-core';
+import { CHAIN_PAYLOAD_VERSION, buildChainContentV3 } from '../lib/chain-content.js';
+import { signRecord } from '../lib/signing.js';
 import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
@@ -353,12 +355,6 @@ async function processFileChange(
   const previousHash = lastInChain?.chain_hash || null;
   const chainIndex = (lastInChain?.chain_index ?? -1) + 1;
 
-  const chainHash = computeChainHash(
-    { type: 'file_change', action_type: 'SYNC', actor_id: tenantId, file_hash: fileHash },
-    previousHash,
-    now,
-  );
-
   const diffSummary = previousVersion
     ? JSON.stringify({
         previousHash: previousVersion.file_hash,
@@ -369,6 +365,72 @@ async function processFileChange(
 
   const actor = file.lastModifyingUser?.displayName || 'Google Drive User';
   const actorId = file.lastModifyingUser?.emailAddress || tenantId;
+
+  // 🔴 v2 결함: 해시는 `now` 로 계산하면서 occurred_at 에는 `file.modifiedTime` 을 저장했다.
+  //    두 값이 달라서 그 행은 애초에 재계산이 불가능했다(검증기가 생기기 전이라 아무도 몰랐다).
+  //    v3부터는 occurred_at 을 해시 타임스탬프로 그대로 쓴다 — 저장한 값으로 검증되어야 한다.
+  const occurredAt = file.modifiedTime || now;
+
+  const eventCols = {
+    id: eventId,
+    decision_id: decisionId,
+    type: 'file_change',
+    source_type: 'harness',
+    status: 'recorded',
+
+    actor_id: actorId,
+    actor_type: 'human',
+    actor_name: actor,
+    actor_metadata: null,
+
+    action_type: 'SYNC',
+    action_description: `File synced from Google Drive: ${file.name}`,
+    action_input: null,
+    action_output: null,
+    action_metadata: JSON.stringify({
+      fileId,
+      filename: file.name,
+      fileHash,
+      sizeBytes: buffer.length,
+      mimeType: file.mimeType,
+      version: versionNumber,
+      source: 'google_drive',
+      integrationId,
+      driveFileId: file.id,
+      modifiedTime: file.modifiedTime,
+    }),
+
+    ai_model: null,
+    ai_provider: null,
+    ai_confidence: null,
+    ai_prompt_hash: null,
+    ai_reasoning: null,
+    ai_tokens_input: null,
+    ai_tokens_output: null,
+    ai_metadata: null,
+
+    evidence_id: evidenceId,
+    evidence_level: 'DRAFT',
+    chain_index: chainIndex,
+    previous_hash: previousHash,
+    chain_domain: chainDomain,
+
+    occurred_at: occurredAt,
+    tags: JSON.stringify(['file', 'sync', 'google-drive']),
+    metadata: JSON.stringify({ domain: chainDomain, fileId, integrationId }),
+
+    tenant_id: tenantId,
+    created_at: now,
+    updated_at: now,
+  };
+
+  const chainHash = computeChainHash(
+    buildChainContentV3(eventCols),
+    previousHash,
+    eventCols.occurred_at,
+  );
+
+  const sig = signRecord(chainHash, null);
 
   const transaction = db.transaction(() => {
     // proof_files
@@ -391,41 +453,33 @@ async function processFileChange(
     db.prepare(`
       INSERT INTO decision_events (
         id, decision_id, type, source_type, status,
-        actor_id, actor_type, actor_name,
-        action_type, action_description, action_metadata,
+        actor_id, actor_type, actor_name, actor_metadata,
+        action_type, action_description, action_input, action_output, action_metadata,
+        ai_model, ai_provider, ai_confidence, ai_prompt_hash, ai_reasoning,
+        ai_tokens_input, ai_tokens_output, ai_metadata,
         evidence_id, evidence_level, chain_hash, chain_index, previous_hash, chain_domain,
+        chain_payload_version, signature, signature_alg, signature_key_id,
         occurred_at, tags, metadata,
         tenant_id, created_at, updated_at
       ) VALUES (
-        ?, ?, 'file_change', 'harness', 'recorded',
-        ?, 'human', ?,
-        'SYNC', ?, ?,
-        ?, 'DRAFT', ?, ?, ?, ?,
-        ?, ?, ?,
-        ?, ?, ?
+        @id, @decision_id, @type, @source_type, @status,
+        @actor_id, @actor_type, @actor_name, @actor_metadata,
+        @action_type, @action_description, @action_input, @action_output, @action_metadata,
+        @ai_model, @ai_provider, @ai_confidence, @ai_prompt_hash, @ai_reasoning,
+        @ai_tokens_input, @ai_tokens_output, @ai_metadata,
+        @evidence_id, @evidence_level, @chain_hash, @chain_index, @previous_hash, @chain_domain,
+        @chain_payload_version, @signature, @signature_alg, @signature_key_id,
+        @occurred_at, @tags, @metadata,
+        @tenant_id, @created_at, @updated_at
       )
-    `).run(
-      eventId, decisionId,
-      actorId, actor,
-      `File synced from Google Drive: ${file.name}`,
-      JSON.stringify({
-        fileId,
-        filename: file.name,
-        fileHash,
-        sizeBytes: buffer.length,
-        mimeType: file.mimeType,
-        version: versionNumber,
-        source: 'google_drive',
-        integrationId,
-        driveFileId: file.id,
-        modifiedTime: file.modifiedTime,
-      }),
-      evidenceId, chainHash, chainIndex, previousHash, chainDomain,
-      file.modifiedTime || now,
-      JSON.stringify(['file', 'sync', 'google-drive']),
-      JSON.stringify({ domain: chainDomain, fileId, integrationId }),
-      tenantId, now, now,
-    );
+    `).run({
+      ...eventCols,
+      chain_hash: chainHash,
+      chain_payload_version: CHAIN_PAYLOAD_VERSION,
+      signature: sig?.signature ?? null,
+      signature_alg: sig?.alg ?? null,
+      signature_key_id: sig?.keyId ?? null,
+    });
   });
 
   transaction();

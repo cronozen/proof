@@ -47,6 +47,20 @@ CREATE TABLE IF NOT EXISTS decision_events (
   previous_hash TEXT,
   chain_domain TEXT DEFAULT 'default',
 
+  -- 체인 페이로드 버전 — 이 행의 chain_hash가 어떤 필드 집합으로 계산됐는지.
+  -- NULL/2 = 레거시(type·action_type·actor_id 3개만 덮음), 3 = 전체 레코드.
+  -- 검증기는 이 값으로 빌더를 고른다. 버전 없이 필드를 바꾸면 옛 행이 전부 실패한다.
+  chain_payload_version INTEGER,
+
+  -- 봉인 해시 — 승인은 레코드 생성 이후에 일어나므로 chain_hash가 덮지 못한다.
+  -- 이 값이 승인자·승인결과·봉인시각을 chain_hash에 묶는다.
+  seal_hash TEXT,
+
+  -- 서버 서명 (Ed25519) — DB 쓰기 권한만으로는 위조할 수 없게 한다.
+  signature TEXT,
+  signature_alg TEXT,
+  signature_key_id TEXT,
+
   -- Approval
   approver_id TEXT,
   approver_type TEXT,

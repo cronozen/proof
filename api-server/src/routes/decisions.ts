@@ -9,7 +9,13 @@
 
 import { Hono } from 'hono';
 import { getDB } from '../db/connection.js';
-import { computeChainHash } from '@cronozen/dpu-core';
+import { computeChainHash, computeObjectHash } from '@cronozen/dpu-core';
+import {
+  CHAIN_PAYLOAD_VERSION,
+  buildChainContentV3,
+  buildSealContent,
+} from '../lib/chain-content.js';
+import { signRecord } from '../lib/signing.js';
 import type { AuthContext } from '../middleware/auth.js';
 import type { QuotaInfo } from '../middleware/quota.js';
 
@@ -70,17 +76,68 @@ decisionsRouter.post('/', async (c) => {
   const previousHash = lastInChain?.chain_hash || null;
   const chainIndex = (lastInChain?.chain_index ?? -1) + 1;
 
-  const chainHash = computeChainHash(
-    { type, action_type: action.type, actor_id: actor.id },
-    previousHash,
-    occurredAt || now,
-  );
-
   const evidenceId = `evi_${crypto.randomUUID().replace(/-/g, '').slice(0, 16)}`;
 
   // source_type 자동 추론: aiContext가 있으면 'ai', 명시적 값 우선
   const resolvedSourceType = sourceType
     || (aiContext ? 'ai' : 'manual');
+
+  // 🔑 컬럼값을 먼저 확정한 뒤 그 객체에서 해시를 뽑는다.
+  //    검증기(lib/verification.ts)는 DB 행을 같은 빌더에 넣으므로,
+  //    기록 시점과 검증 시점의 입력이 같은 모양임이 구조적으로 보장된다.
+  //    해시를 별도 리터럴로 따로 계산하면 바로 여기서 두 경로가 갈라진다.
+  const cols = {
+    id,
+    decision_id: decisionId,
+    type,
+    source_type: resolvedSourceType,
+    status: 'recorded',
+
+    actor_id: actor.id,
+    actor_type: actor.type || 'human',
+    actor_name: actor.name || null,
+    actor_metadata: actor.metadata ? JSON.stringify(actor.metadata) : null,
+
+    action_type: action.type,
+    action_description: action.description || null,
+    action_input: action.input ? JSON.stringify(action.input) : null,
+    action_output: action.output ? JSON.stringify(action.output) : null,
+    action_metadata: action.metadata ? JSON.stringify(action.metadata) : null,
+
+    ai_model: aiContext?.model || null,
+    ai_provider: aiContext?.provider || null,
+    ai_confidence: aiContext?.confidence ?? null,
+    ai_prompt_hash: aiContext?.promptHash || null,
+    ai_reasoning: aiContext?.reasoning || null,
+    ai_tokens_input: aiContext?.tokens?.input ?? null,
+    ai_tokens_output: aiContext?.tokens?.output ?? null,
+    ai_metadata: aiContext ? JSON.stringify(aiContext.metadata || {}) : null,
+
+    evidence_id: evidenceId,
+    evidence_level: 'DRAFT',
+    chain_index: chainIndex,
+    previous_hash: previousHash,
+    chain_domain: chainDomain,
+
+    occurred_at: occurredAt || now,
+    tags: tags ? JSON.stringify(tags) : null,
+    metadata: metadata ? JSON.stringify(metadata) : null,
+    idempotency_key: idempotencyKey || null,
+
+    tenant_id: auth.tenantId,
+    api_key_id: auth.apiKeyId,
+    created_at: now,
+    updated_at: now,
+  };
+
+  const chainHash = computeChainHash(
+    buildChainContentV3(cols),
+    previousHash,
+    cols.occurred_at,
+  );
+
+  // 서명 키가 없으면 null — 서명한 척하지 않는다. 검증 응답이 그 상태를 그대로 말한다.
+  const sig = signRecord(chainHash, null);
 
   db.prepare(`
     INSERT INTO decision_events (
@@ -90,32 +147,28 @@ decisionsRouter.post('/', async (c) => {
       ai_model, ai_provider, ai_confidence, ai_prompt_hash, ai_reasoning,
       ai_tokens_input, ai_tokens_output, ai_metadata,
       evidence_id, evidence_level, chain_hash, chain_index, previous_hash, chain_domain,
+      chain_payload_version, signature, signature_alg, signature_key_id,
       occurred_at, tags, metadata, idempotency_key,
       tenant_id, api_key_id, created_at, updated_at
     ) VALUES (
-      ?, ?, ?, ?, 'recorded',
-      ?, ?, ?, ?,
-      ?, ?, ?, ?, ?,
-      ?, ?, ?, ?, ?,
-      ?, ?, ?,
-      ?, 'DRAFT', ?, ?, ?, ?,
-      ?, ?, ?, ?,
-      ?, ?, ?, ?
+      @id, @decision_id, @type, @source_type, @status,
+      @actor_id, @actor_type, @actor_name, @actor_metadata,
+      @action_type, @action_description, @action_input, @action_output, @action_metadata,
+      @ai_model, @ai_provider, @ai_confidence, @ai_prompt_hash, @ai_reasoning,
+      @ai_tokens_input, @ai_tokens_output, @ai_metadata,
+      @evidence_id, @evidence_level, @chain_hash, @chain_index, @previous_hash, @chain_domain,
+      @chain_payload_version, @signature, @signature_alg, @signature_key_id,
+      @occurred_at, @tags, @metadata, @idempotency_key,
+      @tenant_id, @api_key_id, @created_at, @updated_at
     )
-  `).run(
-    id, decisionId, type, resolvedSourceType,
-    actor.id, actor.type || 'human', actor.name || null, actor.metadata ? JSON.stringify(actor.metadata) : null,
-    action.type, action.description || null, action.input ? JSON.stringify(action.input) : null,
-    action.output ? JSON.stringify(action.output) : null, action.metadata ? JSON.stringify(action.metadata) : null,
-    aiContext?.model || null, aiContext?.provider || null, aiContext?.confidence || null,
-    aiContext?.promptHash || null, aiContext?.reasoning || null,
-    aiContext?.tokens?.input || null, aiContext?.tokens?.output || null,
-    aiContext ? JSON.stringify(aiContext.metadata || {}) : null,
-    evidenceId, chainHash, chainIndex, previousHash, chainDomain,
-    occurredAt || now, tags ? JSON.stringify(tags) : null,
-    metadata ? JSON.stringify(metadata) : null, idempotencyKey || null,
-    auth.tenantId, auth.apiKeyId, now, now,
-  );
+  `).run({
+    ...cols,
+    chain_hash: chainHash,
+    chain_payload_version: CHAIN_PAYLOAD_VERSION,
+    signature: sig?.signature ?? null,
+    signature_alg: sig?.alg ?? null,
+    signature_key_id: sig?.keyId ?? null,
+  });
 
   const inserted = db.prepare('SELECT * FROM decision_events WHERE id = ?').get(id);
   const quota = c.get('quota');
@@ -205,27 +258,63 @@ decisionsRouter.post('/:id/approvals', async (c) => {
   const newStatus = approvalResult === 'approved' ? 'sealed' : 'rejected';
   const evidenceLevel = approvalResult === 'approved' ? 'AUDIT_READY' : 'DRAFT';
 
+  // 🔑 승인은 레코드 생성 **이후**에 일어나므로 chain_hash가 덮지 못한다.
+  //    seal_hash가 그 공백을 메운다 — 없으면 승인자와 승인결과를 나중에 자유롭게 바꿀 수 있고,
+  //    감사에서 가장 먼저 문제되는 값이 정확히 그것이다.
+  const sealFields = {
+    chain_hash: row.chain_hash ?? '',
+    decision_id: row.decision_id,
+    evidence_id: row.evidence_id,
+    status: newStatus,
+    evidence_level: evidenceLevel,
+    approver_id: approver.id,
+    approver_type: approver.type || 'human',
+    approver_name: approver.name || null,
+    approval_result: approvalResult,
+    approval_reason: reason || null,
+    approved_at: approvedAt || now,
+    sealed_at: approvalResult === 'approved' ? now : null,
+  };
+
+  const sealHash = computeObjectHash(buildSealContent(sealFields));
+
+  // 서명은 chain_hash와 seal_hash를 함께 묶는다 → 승인 내용이 바뀌면 서명도 깨진다.
+  const sig = signRecord(sealFields.chain_hash, sealHash);
+
   db.prepare(`
     UPDATE decision_events SET
-      status = ?,
-      evidence_level = ?,
-      approver_id = ?,
-      approver_type = ?,
-      approver_name = ?,
-      approval_result = ?,
-      approval_reason = ?,
-      approved_at = ?,
-      sealed_at = ?,
-      updated_at = ?
-    WHERE id = ?
-  `).run(
-    newStatus, evidenceLevel,
-    approver.id, approver.type || 'human', approver.name || null,
-    approvalResult, reason || null,
-    approvedAt || now,
-    approvalResult === 'approved' ? now : null,
-    now, row.id,
-  );
+      status = @status,
+      evidence_level = @evidence_level,
+      approver_id = @approver_id,
+      approver_type = @approver_type,
+      approver_name = @approver_name,
+      approval_result = @approval_result,
+      approval_reason = @approval_reason,
+      approved_at = @approved_at,
+      sealed_at = @sealed_at,
+      seal_hash = @seal_hash,
+      signature = @signature,
+      signature_alg = @signature_alg,
+      signature_key_id = @signature_key_id,
+      updated_at = @updated_at
+    WHERE id = @id
+  `).run({
+    status: sealFields.status,
+    evidence_level: sealFields.evidence_level,
+    approver_id: sealFields.approver_id,
+    approver_type: sealFields.approver_type,
+    approver_name: sealFields.approver_name,
+    approval_result: sealFields.approval_result,
+    approval_reason: sealFields.approval_reason,
+    approved_at: sealFields.approved_at,
+    sealed_at: sealFields.sealed_at,
+    seal_hash: sealHash,
+    signature: sig?.signature ?? null,
+    signature_alg: sig?.alg ?? null,
+    signature_key_id: sig?.keyId ?? null,
+    updated_at: now,
+    id: row.id,
+  });
 
   const updated = db.prepare('SELECT * FROM decision_events WHERE id = ?').get(row.id) as EventRow;
 
