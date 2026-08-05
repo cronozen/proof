@@ -25,11 +25,22 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          # Dockerfile 과 같은 메이저를 쓴다. 로컬(node 25)에서 통과하는 것이
+          # CI(node 20)에서 깨지는 일을 막는다 — 실제로 테스트 글롭이 그랬다.
+          node-version: 22
           cache: npm
 
       - name: Install
         run: npm ci
+
+      # 🔴 빌드가 typecheck·test 앞에 와야 한다.
+      #
+      # `packages/*/dist` 는 .gitignore 라 클린 체크아웃에 존재하지 않는데,
+      # dpu-core 의 package.json `exports` 는 `./dist/*` 를 가리킨다.
+      # 따라서 api-server 가 `@cronozen/dpu-core` 를 import 하는 순간 해석에 실패한다.
+      # 로컬에는 dist 가 남아 있어서 이 결함이 안 보인다 — CI 의 클린 체크아웃만 잡는다.
+      - name: Build workspace packages
+        run: npm run build --workspace=packages/dp-schema-public --workspace=packages/dpu-core
 
       - name: Typecheck
         run: npm run typecheck

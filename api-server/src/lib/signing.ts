@@ -216,11 +216,28 @@ export function verifyRecordSignature(input: {
     };
   }
 
-  if (input.signatureAlg && input.signatureAlg !== SIGNATURE_ALG) {
+  // 🔴 `input.signatureAlg &&` 로 감싸면 alg 를 null 로 지우는 것만으로 이 검사를 건너뛴다.
+  //    행에 있는 값은 전부 공격자가 쓸 수 있으므로, **없는 것도 불일치로 본다.**
+  if (input.signatureAlg !== SIGNATURE_ALG) {
     return {
       status: 'invalid',
-      alg: input.signatureAlg,
-      detail: `Unsupported signature algorithm: ${input.signatureAlg}`,
+      alg: input.signatureAlg ?? undefined,
+      detail: input.signatureAlg
+        ? `Unsupported signature algorithm: ${input.signatureAlg}`
+        : 'Signature is present but carries no algorithm — the algorithm field was stripped.',
+    };
+  }
+
+  // 🔴 keyId 는 행에 저장된 값(=공격자가 쓸 수 있는 값)이다. 검증은 서버 키로 하므로
+  //    우회는 아니지만, 그 값을 그대로 응답에 실으면 "valid" 옆에 **남의 키 이름**이 뜬다.
+  //    검증자가 /verify/public-key 와 대조했을 때 어긋나 보이므로 여기서 잘라낸다.
+  const signer = getSigner();
+  const expectedKeyId = signer?.keyId ?? process.env.PROOF_SIGNING_KEY_ID?.trim() ?? null;
+  if (expectedKeyId && input.signatureKeyId && input.signatureKeyId !== expectedKeyId) {
+    return {
+      status: 'invalid',
+      alg: SIGNATURE_ALG,
+      detail: 'Signature key id does not match the key this server verifies with.',
     };
   }
 
@@ -235,7 +252,8 @@ export function verifyRecordSignature(input: {
   return {
     status: ok ? 'valid' : 'invalid',
     alg: SIGNATURE_ALG,
-    keyId: input.signatureKeyId ?? undefined,
+    // 저장된 값이 아니라 **실제로 검증에 쓴 키**를 보고한다.
+    keyId: expectedKeyId ?? undefined,
   };
 }
 

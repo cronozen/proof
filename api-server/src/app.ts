@@ -115,7 +115,15 @@ app.get('/verify/:id', (c) => {
   }
 
   const result = verifyRecord(db, row);
-  const coverage = computeCoverage(db, row);
+
+  // 🔴 Coverage 는 옵트인이다 (`?coverage=1`).
+  //
+  // 이 라우트는 무인증이고, computeCoverage 는 같은 체인의 레코드를 최대 COVERAGE_SCAN_LIMIT 건
+  // **재검증**한다(각 건마다 링크 조회 2회 + SHA-256 여러 번). 요청 한 번이 수천 쿼리가 되고,
+  // 배포본은 shared-cpu-1x / 256MB 단일 머신이다. 무인증 루프 하나로 유일한 머신을 재울 수 있다.
+  // 검증자에게 꼭 필요한 건 이 레코드의 판정이고, Coverage 는 화면이 필요할 때만 요청하면 된다.
+  const wantCoverage = ['1', 'true', 'yes'].includes((c.req.query('coverage') || '').toLowerCase());
+  const coverage = wantCoverage ? computeCoverage(db, row) : null;
 
   return c.json({
     verified: result.verified,
@@ -138,19 +146,38 @@ app.get('/verify/:id', (c) => {
       sealedAt: row.sealed_at || null,
     },
 
-    coverage: {
-      totalEvents: coverage.totalEvents,
-      verifiedEvents: coverage.verifiedEvents,
-      // 이벤트 **이름**은 내보내지 않는다("심사반려"·"정산보류" 자체가 운영 정보다).
-      ...(coverage.truncated
-        ? { truncated: true, scanned: coverage.scanned, note: `Coverage computed over the first ${coverage.scanned} events.` }
-        : {}),
-    },
+    coverage: coverage
+      ? {
+          totalEvents: coverage.totalEvents,
+          verifiedEvents: coverage.verifiedEvents,
+          // 이벤트 **이름**은 내보내지 않는다("심사반려"·"정산보류" 자체가 운영 정보다).
+          ...(coverage.truncated
+            ? { truncated: true, scanned: coverage.scanned, note: `Coverage computed over the first ${coverage.scanned} events.` }
+            : {}),
+        }
+      : { computed: false, hint: 'Add ?coverage=1 to compute chain coverage (costlier).' },
 
     limitations: [
-      'This endpoint proves that the record we hold is internally consistent and unaltered since recording.',
+      'This endpoint proves that the record we hold is internally consistent with the hashes we hold.',
       'It is not third-party attestation: there is no RFC 3161 trusted timestamp and no external anchor yet.',
-      'Server signature (when configured) lets you verify independently using the public key at /verify/public-key.',
+      // 🔴 서명이 없으면 해시 재계산은 **DB 를 쓸 수 있는 사람** 앞에서 무력하다.
+      //    그 사람은 내용을 바꾸고 해시도 다시 계산하면 그만이다.
+      //    "unaltered since recording" 이라고 단언하면 그 사실을 덮는다.
+      ...(result.checks.serverSignature.status === 'valid'
+        ? [
+            'A valid server signature is present: forging this record requires the signing key, not just database write access. ' +
+              'Verify it yourself with the public key at /verify/public-key.',
+          ]
+        : [
+            'WARNING: no valid server signature on this record. Hash recomputation alone does NOT stop someone with ' +
+              'database write access — they can change the content and recompute the hash. Treat this as an integrity ' +
+              'check against accidental change, not as proof against a determined insider.',
+          ]),
+      // 🔴 이전의 정당한 상태로 **되돌리는 것**은 안에서 탐지할 수 없다.
+      //    승인 전 서명값을 보관했다가 승인 필드를 지우고 그 서명을 복원하면,
+      //    메시지가 그 시점과 바이트 단위로 같아서 서명이 그대로 맞는다. 꼬리 절단과 같은 계열이다.
+      'Rollback to an earlier legitimate state (for example removing an approval and restoring the pre-approval ' +
+        'signature) is not detectable from inside the database. Detecting it requires an external anchor.',
       // 🔴 꼬리 절단은 구조적으로 탐지 불가다. 마지막 N건을 지우면 남은 체인은
       //    인덱스가 연속이고 링크도 맞아 "정상"으로 보인다. 안에서는 풀 수 없는 문제 —
       //    체인의 머리를 밖에 박아두는 외부 앵커가 있어야 한다.

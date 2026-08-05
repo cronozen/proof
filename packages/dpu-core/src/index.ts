@@ -47,6 +47,25 @@ export {
   computeObjectHash,
 } from './hash';
 
+// ==================== Verification (판정 SSoT) ====================
+//
+// 🔑 검증기가 여러 개면 같은 레코드에 상반된 판정이 나오고, 그 불일치가 감사에서
+//    반대증거가 된다. "무엇을 통과로 볼 것인가"는 여기 하나뿐이어야 한다.
+//    재계산·DB 조회·서명 검증은 호출자의 몫이고, 판정만 공유한다.
+
+export {
+  evaluateVerification,
+  evaluateChainHash,
+  evaluateChainLink,
+  type ChainHashCandidate,
+  type ChainHashVerdict,
+  type ChainLinkInput,
+  type Check,
+  type LinkState,
+  type VerificationInput,
+  type VerificationVerdict,
+} from './verify';
+
 // ==================== Envelope ====================
 
 export {

@@ -29,7 +29,15 @@
  */
 
 import type { Database } from 'better-sqlite3';
-import { computeChainHash, computeObjectHash } from '@cronozen/dpu-core';
+import {
+  computeChainHash,
+  computeObjectHash,
+  evaluateVerification,
+  type ChainHashCandidate,
+  type ChainHashVerdict,
+  type Check,
+  type LinkState,
+} from '@cronozen/dpu-core';
 import {
   CHAIN_PAYLOAD_VERSION,
   buildChainContentV2,
@@ -63,10 +71,7 @@ export interface DecisionEventRow extends ChainColumns {
   created_at: string;
 }
 
-export interface Check {
-  ok: boolean;
-  detail?: string;
-}
+export type { Check };
 
 export type ChainScheme = 'v2' | 'v3';
 
@@ -78,18 +83,7 @@ export type ChainScheme = 'v2' | 'v3';
  *    거짓 통과를 냈다. 검증이 없는 것보다 나쁜 상태다.)
  *    그래서 `matchedScheme`은 저장된 `chain_payload_version`이 아니라 **실제로 일치한 빌더**다.
  */
-export interface ChainHashCheck extends Check {
-  matchedScheme: ChainScheme | null;
-  /**
-   * 이 해시가 레코드 **내용**까지 덮는가.
-   *
-   * 🔴 v2는 `type`·`action_type`·`actor_id` 3개만 덮는다. 즉 v2 레코드는
-   *    `verified: true`여도 산출물·AI 근거·승인 결과를 바꿔치기할 수 있다.
-   *    이 값을 함께 내보내지 않으면 "verified"가 실제보다 훨씬 강하게 읽힌다.
-   *    해시가 안 맞았으면 단정하지 않고 null.
-   */
-  contentBound: boolean | null;
-}
+export type ChainHashCheck = ChainHashVerdict;
 
 export interface VerificationResult {
   verified: boolean;
@@ -105,20 +99,74 @@ export interface VerificationResult {
   failures: string[];
 }
 
-// ─── 콘텐츠 복원 ────────────────────────────────────────────────────
+/**
+ * 이 행이 **구 google-drive 동기화 경로**로 기록됐는가.
+ *
+ * 그 경로에만 두 개의 기록 결함이 있었고(아래), 폴백은 여기에만 적용한다.
+ * v2 행 전체에 폴백을 열면 폴백 자체가 변조 통로가 된다 —
+ * 예컨대 타임스탬프 폴백을 모든 v2 행에 열면, occurred_at 을 마음대로 바꿔도
+ * created_at 후보가 맞아버려 통과한다. 좁히는 것이 곧 조이는 것이다.
+ */
+function isLegacyDriveRow(row: DecisionEventRow): boolean {
+  return (row.chain_payload_version ?? 2) < 3
+    && row.type === 'file_change'
+    && row.source_type === 'harness';
+}
 
 /**
- * 이 행이 기록될 때 쓰인 체인 콘텐츠를 그대로 되만든다.
+ * 구 google-drive 경로의 기록 결함 2종 — 폴백으로 구제한다.
  *
- * 버전별로 빌더가 갈린다. v2 행을 v3 규칙으로 검증하면 멀쩡한 기록이 전부 실패한다 —
- * 그건 변조 탐지가 아니라 거짓 경보다.
+ * 🔴 결함 A (타임스탬프): 해시는 `now` 로 계산하면서 occurred_at 에는
+ *    `file.modifiedTime` 을 저장했다. 두 값이 다르면 재계산이 불가능하다.
+ *    당시의 `now` 는 created_at 에 남아 있으므로 그것도 시도한다.
+ *
+ * 🔴 결함 B (행위자): 해시에는 `actor_id: tenantId` 를 넣고, 저장은
+ *    `actor_id = lastModifyingUser.emailAddress || tenantId` 로 했다.
+ *    수정자 이메일이 있는 행은 저장값으로 재계산하면 **반드시 어긋난다.**
+ *    변조가 아닌데 변조로 보고하게 되므로 tenant_id 도 후보로 넣는다.
+ *
+ * 둘 다 "검증을 느슨하게" 하는 게 아니라 **기록 당시 실제로 쓰인 입력**을 찾는 것이다.
+ * 그래서 신규(v3) 행에는 절대 적용되지 않는다.
  */
-function rebuildChainContent(db: Database, row: DecisionEventRow): Record<string, unknown> {
+function legacyDriveVariants(row: DecisionEventRow): { timestamp: string; actorId: string }[] {
+  const timestamps = [row.occurred_at];
+  if (row.created_at && row.created_at !== row.occurred_at) timestamps.push(row.created_at);
+
+  const actorIds = [row.actor_id];
+  if (row.tenant_id && row.tenant_id !== row.actor_id) actorIds.push(row.tenant_id);
+
+  const variants: { timestamp: string; actorId: string }[] = [];
+  for (const timestamp of timestamps) {
+    for (const actorId of actorIds) variants.push({ timestamp, actorId });
+  }
+  return variants;
+}
+
+// ─── 개별 검사 ──────────────────────────────────────────────────────
+//
+// 🔑 재계산·DB 조회는 여기서 하고, **판정은 @cronozen/dpu-core 에 위임한다.**
+//    "무엇을 통과로 볼 것인가"가 검증기마다 갈리면 같은 레코드에 상반된 판정이 나오고,
+//    그 불일치 자체가 감사에서 반대증거가 된다(ops F10). 판정 정본은 하나여야 한다.
+
+/**
+ * 이 행이 기록될 때 쓰였을 수 있는 해시 후보들.
+ *
+ * `contentBound` 는 **이 계산이 레코드 내용을 덮는지**를 우리가 선언하는 값이다.
+ * v3 는 레코드 전체를 덮고, v2 는 type·action_type·actor_id 3개뿐이다.
+ * 엔진은 이 값을 해석하지 않고, 실제로 일치한 후보의 값을 그대로 보고한다.
+ */
+function buildHashCandidates(db: Database, row: DecisionEventRow): ChainHashCandidate[] {
   const version = row.chain_payload_version ?? 2;
 
-  if (version >= 3) return buildChainContentV3(row);
+  if (version >= 3) {
+    return [{
+      scheme: 'proof.v3',
+      hash: computeChainHash(buildChainContentV3(row), row.previous_hash ?? null, row.occurred_at),
+      contentBound: true,
+    }];
+  }
 
-  // v2: file_change 이벤트는 file_hash를 추가로 넣었으므로 proof_files에서 되찾아온다.
+  // ── v2 레거시 ──
   let fileHash: string | null = null;
   if (row.type === 'file_change') {
     const file = db
@@ -126,85 +174,45 @@ function rebuildChainContent(db: Database, row: DecisionEventRow): Record<string
       .get(row.id) as { file_hash: string } | undefined;
     fileHash = file?.file_hash ?? null;
   }
-  return buildChainContentV2(row, fileHash);
+
+  // 구 drive 경로가 아니면 폴백 없이 저장된 값 그대로 한 번만 계산한다.
+  if (!isLegacyDriveRow(row)) {
+    return [{
+      scheme: 'proof.v2',
+      hash: computeChainHash(buildChainContentV2(row, fileHash), row.previous_hash ?? null, row.occurred_at),
+      contentBound: false,
+    }];
+  }
+
+  return legacyDriveVariants(row).map(({ timestamp, actorId }) => ({
+    scheme: 'proof.v2-drive',
+    hash: computeChainHash(
+      buildChainContentV2({ ...row, actor_id: actorId }, fileHash),
+      row.previous_hash ?? null,
+      timestamp,
+    ),
+    contentBound: false,
+  }));
 }
 
 /**
- * 체인 해시 계산에 쓰인 타임스탬프 후보.
+ * 선행·후행 링크 상태를 DB 에서 읽어 3상태로 만든다.
  *
- * v3은 항상 occurred_at 하나다 — 저장한 값으로 검증되어야 한다는 것이 규칙이다.
- *
- * 🔴 v2에는 결함이 있었다: services/google-drive.ts 는 해시를 `now` 로 계산하면서
- *    occurred_at 컬럼에는 `file.modifiedTime` 을 저장했다. 두 값이 다르면 그 행은
- *    재계산이 불가능하다. 검증기가 없던 시절이라 아무도 몰랐던 결함이다.
- *    옛 행을 "변조됨"으로 몰지 않기 위해 v2에 한해 created_at(=당시의 `now`)도 시도한다.
- *    이건 검증 완화가 아니라, 기록 당시 실제로 쓰인 입력을 찾는 것이다.
+ * `null` = 대상 레코드가 없음(체인의 시작/끝) → 통과.
+ * `false` = 대상이 있는데 어긋남, 또는 있어야 할 선행이 없음 → 실패.
+ * 없는 것과 어긋난 것을 같게 취급하면 둘 다 놓친다.
  */
-function chainTimestampCandidates(row: DecisionEventRow): string[] {
-  const version = row.chain_payload_version ?? 2;
-  if (version >= 3) return [row.occurred_at];
-
-  const candidates = [row.occurred_at];
-  if (row.created_at && row.created_at !== row.occurred_at) candidates.push(row.created_at);
-  return candidates;
-}
-
-// ─── 개별 검사 ──────────────────────────────────────────────────────
-
-function checkChainHash(db: Database, row: DecisionEventRow): ChainHashCheck {
-  if (!row.chain_hash) {
-    return { ok: false, matchedScheme: null, contentBound: null, detail: 'Record has no chain hash.' };
-  }
-
-  const version = row.chain_payload_version ?? 2;
-  const scheme: ChainScheme = version >= 3 ? 'v3' : 'v2';
-  const content = rebuildChainContent(db, row);
-
-  for (const timestamp of chainTimestampCandidates(row)) {
-    const recomputed = computeChainHash(content, row.previous_hash ?? null, timestamp);
-    if (recomputed === row.chain_hash) {
-      return {
-        ok: true,
-        matchedScheme: scheme,
-        contentBound: scheme === 'v3',
-        detail:
-          scheme === 'v3'
-            ? undefined
-            : 'Legacy v2 record: the hash covers only type, action type and actor — the outcome, AI reasoning and approval fields are NOT bound by it.',
-      };
-    }
-  }
-
-  return {
-    ok: false,
-    matchedScheme: null,
-    contentBound: null,
-    detail: 'Recomputed hash does not match the stored chain hash — record content was altered after recording.',
-  };
-}
-
-/**
- * 체인 연결 — 앞뒤 **양방향**.
- *
- * chain_hash만 맞아도 **행 하나를 통째로 빼내는 것**은 잡히지 않는다.
- * 앞 레코드가 실제로 존재하고 그 해시가 previous_hash와 같은지까지 봐야 한다.
- *
- * 🔴 후행(next) 링크도 봐야 한다. 앞만 보면 **뒤가 끊겨도 "통과"**라고 답한다 —
- *    thearound-ops가 2026-07-31 독립검증에서 정확히 이 구멍을 지적받고 조인 항목이다.
- *    (ops PROD 실측: next_link 보유 43,898건 중 불일치 0건 → 조여도 뒤집히는 레코드가 없었다.)
- *
- * 링크는 3상태다: 대상이 **없으면**(체인의 끝/시작) null → 통과로 본다.
- * 대상이 있는데 어긋나면 실패다. 없는 것과 어긋난 것을 같게 취급하면 둘 다 놓친다.
- */
-function checkChainLink(db: Database, row: DecisionEventRow): Check {
+function readLinkState(db: Database, row: DecisionEventRow): {
+  previousLinkValid: LinkState;
+  nextLinkValid: LinkState;
+  previousMissing: boolean;
+} {
   const index = row.chain_index;
 
-  // ── 선행 링크 ──
-  if (index === 0) {
-    if (row.previous_hash) {
-      return { ok: false, detail: 'Genesis record (index 0) must not reference a previous hash.' };
-    }
-  } else {
+  let previousLinkValid: LinkState = null;
+  let previousMissing = false;
+
+  if (index > 0) {
     const previous = db
       .prepare(
         'SELECT chain_hash FROM decision_events WHERE chain_domain = ? AND tenant_id = ? AND chain_index = ?',
@@ -212,37 +220,22 @@ function checkChainLink(db: Database, row: DecisionEventRow): Check {
       .get(row.chain_domain, row.tenant_id, index - 1) as { chain_hash: string | null } | undefined;
 
     if (!previous) {
-      return { ok: false, detail: `Previous record at chain index ${index - 1} is missing — the chain has a gap.` };
-    }
-    if (!row.previous_hash) {
-      return { ok: false, detail: 'Record at a non-zero index carries no previous hash.' };
-    }
-    if (previous.chain_hash !== row.previous_hash) {
-      return {
-        ok: false,
-        detail: 'Previous hash does not match the actual preceding record — the chain was reordered or rewritten.',
-      };
+      previousLinkValid = false;
+      previousMissing = true;
+    } else {
+      previousLinkValid = !!row.previous_hash && previous.chain_hash === row.previous_hash;
     }
   }
 
-  // ── 후행 링크 ──
   const next = db
     .prepare(
       'SELECT previous_hash FROM decision_events WHERE chain_domain = ? AND tenant_id = ? AND chain_index = ?',
     )
     .get(row.chain_domain, row.tenant_id, index + 1) as { previous_hash: string | null } | undefined;
 
-  if (next && next.previous_hash !== row.chain_hash) {
-    return {
-      ok: false,
-      detail: 'The following record does not point back to this one — the chain was rewritten after this record.',
-    };
-  }
+  const nextLinkValid: LinkState = next ? next.previous_hash === row.chain_hash : null;
 
-  return {
-    ok: true,
-    detail: index === 0 ? 'Genesis record.' : undefined,
-  };
+  return { previousLinkValid, nextLinkValid, previousMissing };
 }
 
 /**
@@ -259,6 +252,32 @@ function checkSeal(row: DecisionEventRow): Check {
     if (row.seal_hash) {
       return { ok: false, detail: 'Record carries a seal hash but has no approval — seal was stripped.' };
     }
+
+    // 🔴 봉인 안 된 레코드의 **불변식**.
+    //
+    // chain_hash 는 생성 시점 값만 덮으므로 status·evidence_level·승인자 필드는 그 밖에 있다.
+    // 그래서 `approval_result` 와 `sealed_at` 만 건드리지 않으면, evidence_level 을
+    // 'AUDIT_READY' 로 올리고 승인자 이름을 채워 넣어도 전부 통과했다.
+    // 공개 응답이 evidenceLevel 을 그대로 표시하므로, 승인한 적 없는 건이 감사준비 완료로 보인다.
+    // (2026-08-05 교차검증에서 실제 공격으로 재현됨)
+    //
+    // 해시로 덮을 수 없는 값은 **불변식으로 막는다.** 봉인 전 레코드는 생성 시점 모습이어야 한다.
+    const violations: string[] = [];
+    if (row.status !== 'recorded') violations.push(`status=${row.status}`);
+    if (row.evidence_level && row.evidence_level !== 'DRAFT') violations.push(`evidenceLevel=${row.evidence_level}`);
+    if (row.approver_id) violations.push('approverId');
+    if (row.approver_type) violations.push('approverType');
+    if (row.approver_name) violations.push('approverName');
+    if (row.approval_reason) violations.push('approvalReason');
+    if (row.approved_at) violations.push('approvedAt');
+
+    if (violations.length > 0) {
+      return {
+        ok: false,
+        detail: `Record is not sealed but carries approval state (${violations.join(', ')}) — approval was forged without a seal.`,
+      };
+    }
+
     return { ok: true, detail: 'Not sealed yet (pending approval).' };
   }
 
@@ -306,8 +325,23 @@ function checkSeal(row: DecisionEventRow): Check {
 export function verifyRecord(db: Database, row: DecisionEventRow): VerificationResult {
   const version = row.chain_payload_version ?? 2;
 
-  const chainHash = checkChainHash(db, row);
-  const chainLink = checkChainLink(db, row);
+  // 🔑 해시·링크 판정은 dpu-core 의 단일 엔진에 위임한다.
+  //    여기서 하는 일은 후보를 만들고 링크 상태를 읽어오는 것까지다.
+  const link = readLinkState(db, row);
+  const core = evaluateVerification({
+    storedChainHash: row.chain_hash,
+    candidates: buildHashCandidates(db, row),
+    chainIndex: row.chain_index,
+    previousHash: row.previous_hash,
+    previousLinkValid: link.previousLinkValid,
+    nextLinkValid: link.nextLinkValid,
+    previousMissing: link.previousMissing,
+  });
+
+  const chainHash: ChainHashCheck = core.chainHash;
+  const chainLink: Check = core.chainLink;
+
+  // 봉인·서명은 호출자마다 모델이 달라 엔진에 올리지 않았다(ops 에는 seal_hash 개념이 없다).
   const seal = checkSeal(row);
   const serverSignature = verifyRecordSignature({
     chainHash: row.chain_hash ?? '',
@@ -318,10 +352,34 @@ export function verifyRecord(db: Database, row: DecisionEventRow): VerificationR
     applicable: version >= CHAIN_PAYLOAD_VERSION,
   });
 
-  const failures: string[] = [];
-  if (!chainHash.ok) failures.push(`chainHash: ${chainHash.detail}`);
-  if (!chainLink.ok) failures.push(`chainLink: ${chainLink.detail}`);
+  // 해시·링크 실패 사유는 엔진이 만든 것을 그대로 쓴다 — 여기서 다시 쓰면 문구가 갈리고,
+  // 갈린 문구는 "같은 결함인데 검증기마다 다르게 말하는" 상태가 된다.
+  const failures: string[] = [...core.failures];
   if (!seal.ok) failures.push(`seal: ${seal.detail}`);
+
+  // 🔴 다운그레이드 봉쇄 — 이 조직에서 가장 비싼 종류의 결함이었다.
+  //
+  // `chain_payload_version` 은 **공격자가 쓸 수 있는 DB 컬럼**인데, 그 값 하나가
+  // 세 보호를 동시에 껐다: 내용 결속(v2 는 3필드만) · 봉인 검사(v<3 면 seal 없어도 통과)
+  // · 서명 요구(applicable = v>=3). 그래서 v3 레코드를 v2 로 내리고 3필드 해시를 다시
+  // 계산하면 산출물을 마음대로 바꾸고도 verified:true 가 나왔다.
+  // (2026-08-05 fable·codex 가 독립적으로 같은 지점을 짚었고 실제 공격으로 재현됨)
+  //
+  // 뿌리는 "라벨이 판정 기준을 고른다"는 것이다. 라벨을 못 믿으므로 **결과**로 판정한다:
+  // 실제로 일치한 계산이 레코드 내용을 덮지 못했다면 통과시키지 않는다.
+  // 다운그레이드하면 contentBound 가 false 가 되므로 이 게이트에서 걸린다.
+  //
+  // 진짜 레거시 행은 이 게이트에서 함께 떨어진다. 그건 부작용이 아니라 정직함이다 —
+  // 그 행들의 내용은 애초에 결속된 적이 없어서 "변조되지 않았다"고 말할 근거가 없다.
+  // 옛 관대함이 필요한 운영자는 PROOF_ACCEPT_LEGACY_UNBOUND=true 로 명시적으로 켠다.
+  const acceptUnbound = process.env.PROOF_ACCEPT_LEGACY_UNBOUND === 'true';
+  if (core.chainHash.ok && core.chainHash.contentBound === false && !acceptUnbound) {
+    failures.push(
+      'chainHash: the matching computation does not cover the record content ' +
+        `(scheme ${core.chainHash.matchedScheme}). Cannot attest that the outcome, AI reasoning ` +
+        'or approval fields are unchanged. Set PROOF_ACCEPT_LEGACY_UNBOUND=true to accept legacy records.',
+    );
+  }
   // not_configured / not_applicable 은 판정에서 제외한다 — 서명을 안 켠 것이 위조는 아니다.
   // 반대로 missing/invalid 는 실패다: 키가 있는데 서명이 없다면 다운그레이드 시도로 본다.
   if (serverSignature.status === 'invalid' || serverSignature.status === 'missing') {
@@ -363,6 +421,13 @@ export interface ChainVerificationResult {
     failures: string[];
   }[];
   truncated: boolean;
+  /**
+   * 이 판정이 체인 **전체**를 본 결과인가.
+   *
+   * 🔴 부분 스캔에서 verified:true 를 주면 안 된다 — 깨진 구간을 범위 밖으로 밀어내는 것만으로
+   *    통과를 만들어낼 수 있다(`?limit=0` 이면 아무것도 안 보고 통과했다).
+   */
+  scope: 'full' | 'partial';
 }
 
 /**
@@ -380,7 +445,10 @@ export function verifyChain(
   params: { domain: string; tenantId: string; fromIndex?: number; toIndex?: number; limit?: number },
 ): ChainVerificationResult {
   const { domain, tenantId } = params;
-  const limit = Math.min(params.limit ?? COVERAGE_SCAN_LIMIT, COVERAGE_SCAN_LIMIT);
+  // 🔴 하한이 없으면 `?limit=0` 이 "아무것도 안 봤으니 깨진 게 없다"가 된다.
+  const requested = params.limit ?? COVERAGE_SCAN_LIMIT;
+  const limit = Math.max(1, Math.min(requested, COVERAGE_SCAN_LIMIT));
+  const ranged = params.fromIndex !== undefined || params.toIndex !== undefined;
 
   const total = (
     db
@@ -436,16 +504,23 @@ export function verifyChain(
     });
   }
 
+  const truncated = total > rows.length;
+  // 범위 필터를 걸었거나 전부 못 훑었으면 "부분"이다. 부분 판정은 통과를 만들지 못한다 —
+  // 그러지 않으면 깨진 구간을 범위 밖으로 밀어내는 것만으로 초록불을 살 수 있다.
+  const scope: 'full' | 'partial' = ranged || truncated ? 'partial' : 'full';
+  const clean = firstBrokenIndex === null && missingIndexes.length === 0;
+
   return {
     domain,
-    verified: firstBrokenIndex === null && missingIndexes.length === 0,
+    verified: scope === 'full' && clean,
     totalEvents: total,
     scanned: rows.length,
     verifiedEvents,
     firstBrokenIndex,
     missingIndexes,
     records,
-    truncated: rows.length >= limit && total > rows.length,
+    truncated,
+    scope,
   };
 }
 

@@ -223,8 +223,16 @@ export interface VerificationResponse {
      *    결속되어 있지 않다. 감사 용도로 쓰기 전에 이 값을 반드시 확인할 것.
      */
     chainHash: VerificationCheck & {
-      /** 저장된 라벨이 아니라 **실제로 일치한** 계산 스킴. */
-      matchedScheme: 'v2' | 'v3' | null;
+      /**
+       * 저장된 라벨이 아니라 **실제로 일치한** 계산 스킴.
+       *
+       * 값은 서버가 붙이는 네임스페이스 문자열이다(`proof.v3`, `proof.v2`, `proof.v2-drive` …).
+       * 🪤 유니온으로 좁히지 말 것 — 검증 엔진은 스킴 이름을 해석하지 않고, 호출자마다
+       *    라벨 축이 다르다(ops 는 직렬화 버전, proof 는 페이로드 커버리지 버전).
+       *    좁히면 서버가 스킴을 하나 추가할 때마다 SDK 타입이 런타임과 어긋난다.
+       *    분기 판단에는 이 값이 아니라 `contentBound` 를 쓸 것.
+       */
+      matchedScheme: string | null;
       contentBound: boolean | null;
     };
     chainLink: VerificationCheck;

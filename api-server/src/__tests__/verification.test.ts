@@ -371,9 +371,19 @@ describe('공개 필드 화이트리스트', () => {
     assert.ok(Array.isArray(body.limitations));
   });
 
-  it('Coverage는 개수만 준다 — 이벤트 이름은 주지 않는다', async () => {
+  it('Coverage 는 기본으로 계산하지 않는다 (무인증 증폭 방지)', async () => {
     const event = await recordEvent();
     const { body } = await verify(event.evidence.id);
+
+    // 무인증 요청 하나가 체인 전체를 재검증하면 단일 머신을 재울 수 있다.
+    assert.equal(body.coverage.computed, false);
+    assert.ok(!('totalEvents' in body.coverage));
+  });
+
+  it('?coverage=1 을 주면 개수만 준다 — 이벤트 이름은 주지 않는다', async () => {
+    const event = await recordEvent();
+    const res = await app.fetch(new Request(`http://localhost/verify/${event.evidence.id}?coverage=1`));
+    const body = (await res.json()) as any;
 
     assert.ok(typeof body.coverage.totalEvents === 'number');
     assert.ok(typeof body.coverage.verifiedEvents === 'number');
@@ -492,23 +502,44 @@ describe('레거시 v2 레코드 (2026-08-05 이전 기록)', () => {
     return evidenceId;
   }
 
-  it('v2 행은 v2 규칙으로 검증된다 — 거짓 경보를 내지 않는다', async () => {
+  it('v2 행은 v2 규칙으로 재계산된다 — "변조됨"으로 몰지 않는다', async () => {
     const evidenceId = insertLegacyRow('legacy-ok');
     const { body } = await verify(evidenceId);
 
-    assert.equal(body.verified, true, `failures: ${JSON.stringify(body.failures)}`);
+    // 해시 자체는 맞는다 = 변조 아님. 이게 거짓 경보를 안 낸다는 뜻이다.
+    assert.equal(body.checks.chainHash.ok, true, `변조로 오판했다: ${JSON.stringify(body.failures)}`);
     assert.equal(body.evidence.chainPayloadVersion, 2);
     // 서명 개념이 없던 시절의 행 → 서명 없음을 위조로 몰지 않는다
     assert.equal(body.checks.serverSignature.status, 'not_applicable');
   });
 
-  it('v2 행의 verified=true 는 "내용까지 결속됨"을 뜻하지 않는다 — contentBound로 말한다', async () => {
+  it('🔴 그래도 기본값에서는 verified=false 다 — 내용이 결속된 적이 없으므로 보증할 수 없다', async () => {
+    const evidenceId = insertLegacyRow('legacy-strict');
+    const { body } = await verify(evidenceId);
+
+    assert.equal(body.verified, false, '내용 미결속 레코드가 통과했다 = 다운그레이드 통로');
+    assert.ok(body.failures.some((f: string) => /does not cover the record content/i.test(f)));
+  });
+
+  it('운영자가 명시적으로 켜면 레거시를 받아들인다 (PROOF_ACCEPT_LEGACY_UNBOUND)', async () => {
+    const evidenceId = insertLegacyRow('legacy-optin');
+    process.env.PROOF_ACCEPT_LEGACY_UNBOUND = 'true';
+    try {
+      const { body } = await verify(evidenceId);
+      assert.equal(body.verified, true, `failures: ${JSON.stringify(body.failures)}`);
+      assert.equal(body.checks.chainHash.contentBound, false);
+    } finally {
+      delete process.env.PROOF_ACCEPT_LEGACY_UNBOUND;
+    }
+  });
+
+  it('라벨이 아니라 실제로 맞은 계산을 보고한다 (contentBound)', async () => {
     const evidenceId = insertLegacyRow('legacy-contentbound');
     const { body } = await verify(evidenceId);
 
-    assert.equal(body.verified, true);
     // 라벨이 아니라 실제로 맞은 계산을 보고한다
-    assert.equal(body.checks.chainHash.matchedScheme, 'v2');
+    // 스킴은 호출자 네임스페이스가 붙는다 — ops('ops.v1'/'ops.v2')와 라벨이 충돌하지 않게.
+    assert.equal(body.checks.chainHash.matchedScheme, 'proof.v2');
     assert.equal(body.checks.chainHash.contentBound, false);
     // 응답을 읽는 사람이 과신하지 않도록 경고를 함께 내보낸다
     assert.ok(
@@ -521,7 +552,7 @@ describe('레거시 v2 레코드 (2026-08-05 이전 기록)', () => {
     const event = await recordEvent();
     const { body } = await verify(event.evidence.id);
 
-    assert.equal(body.checks.chainHash.matchedScheme, 'v3');
+    assert.equal(body.checks.chainHash.matchedScheme, 'proof.v3');
     assert.equal(body.checks.chainHash.contentBound, true);
     assert.ok(!body.limitations.some((l: string) => /legacy record/i.test(l)));
   });
@@ -533,6 +564,175 @@ describe('레거시 v2 레코드 (2026-08-05 이전 기록)', () => {
     const { body } = await verify(evidenceId);
     assert.equal(body.verified, false);
     assert.equal(body.checks.chainHash.ok, false);
+  });
+});
+
+// ─── 교차검증에서 나온 실제 공격 (fable · codex, 2026-08-05) ────────
+//
+// 아래 셋은 **재현된 공격**이다. 이 파일의 다른 테스트가 전부 초록이던 시점에
+// 세 개 모두 verified:true 를 받아냈다. 되돌아오면 안 된다.
+
+describe('🔴 재현된 공격 — 회귀 방지', () => {
+  it('공격 1: 승인 없이 evidence_level 만 AUDIT_READY 로 올리기', async () => {
+    const event = await recordEvent({ metadata: { domain: 'atk-approval' } });
+
+    // approval_result·sealed_at 은 건드리지 않는다 → 옛 checkSeal 은 "아직 봉인 안 됨"으로 통과시켰다.
+    tamper(event.evidence.id, 'evidence_level', 'AUDIT_READY');
+    tamper(event.evidence.id, 'status', 'sealed');
+    tamper(event.evidence.id, 'approver_name', '가짜승인자');
+
+    const { body } = await verify(event.evidence.id);
+    assert.equal(body.verified, false, '승인한 적 없는 건이 감사준비 완료로 통과했다');
+    assert.equal(body.checks.seal.ok, false);
+    assert.match(body.checks.seal.detail, /approval was forged/i);
+  });
+
+  it('공격 2: chain_payload_version 을 2로 내리고 3필드 해시를 다시 계산하기', async () => {
+    const event = await recordEvent({ metadata: { domain: 'atk-downgrade' } });
+    const row = db
+      .prepare('SELECT * FROM decision_events WHERE evidence_id = ?')
+      .get(event.evidence.id) as any;
+
+    // 공격자는 서명 키가 없어도 v2 해시는 스스로 계산할 수 있다.
+    const forged = computeChainHash(
+      { type: row.type, action_type: row.action_type, actor_id: row.actor_id },
+      row.previous_hash,
+      row.occurred_at,
+    );
+    db.prepare(`
+      UPDATE decision_events
+      SET action_output = ?, chain_payload_version = 2, chain_hash = ?,
+          signature = NULL, signature_alg = NULL, signature_key_id = NULL
+      WHERE evidence_id = ?
+    `).run(JSON.stringify({ payout: 99_000_000 }), forged, event.evidence.id);
+
+    const { body } = await verify(event.evidence.id);
+    assert.equal(body.verified, false, '버전 한 칸으로 내용결속·봉인·서명이 전부 꺼졌다');
+    assert.equal(body.checks.chainHash.contentBound, false);
+    assert.ok(body.failures.some((f: string) => /does not cover the record content/i.test(f)));
+  });
+
+  it('공격 3: verify-chain 범위 파라미터로 깨진 구간 밀어내기', async () => {
+    const domain = 'atk-scope';
+    const events = [];
+    for (let i = 0; i < 3; i += 1) events.push(await recordEvent({ metadata: { domain } }));
+    tamper(events[0].evidence.id, 'action_output', JSON.stringify({ t: 1 }));
+
+    const call = async (qs: string) => {
+      const res = await app.fetch(
+        new Request(`http://localhost/decision-events/verify-chain/${domain}${qs}`, {
+          headers: { Authorization: `Bearer ${API_KEY}` },
+        }),
+      );
+      return (await res.json() as any).data;
+    };
+
+    assert.equal((await call('')).verified, false, '전체 스캔이 깨진 체인을 못 잡았다');
+
+    // 범위를 좁혀 깨진 레코드를 스캔 밖으로 밀어내도 통과를 살 수 없어야 한다.
+    for (const qs of ['?limit=0', '?limit=1', '?fromIndex=1']) {
+      const d = await call(qs);
+      assert.equal(d.verified, false, `${qs} 로 통과를 사들였다`);
+      assert.equal(d.scope, 'partial', `${qs} 가 전체 스캔으로 보고됐다`);
+    }
+  });
+});
+
+// ─── 구 google-drive 레거시 행 ──────────────────────────────────────
+
+describe('구 google-drive 동기화 행 (기록 결함 2종)', () => {
+  /**
+   * 구 services/google-drive.ts 가 만든 행을 그대로 재현한다.
+   *   해시 입력: actor_id = tenantId,  timestamp = now
+   *   저장 값  : actor_id = 수정자 이메일, occurred_at = file.modifiedTime
+   * 두 값이 모두 어긋나 있어서, 저장된 값으로 재계산하면 반드시 실패한다.
+   */
+  function insertLegacyDriveRow(domain: string, tenantId = 'tenant-test') {
+    const id = crypto.randomUUID();
+    const evidenceId = `evi_drive_${domain}`;
+    const now = '2026-04-01T09:00:00.000Z';        // 해시에 쓰인 값
+    const modifiedTime = '2026-03-30T01:23:45.000Z'; // occurred_at 에 저장된 값
+    const email = 'someone@example.com';             // actor_id 에 저장된 값
+    const fileHash = 'f'.repeat(64);
+
+    const chainHash = computeChainHash(
+      { type: 'file_change', action_type: 'SYNC', actor_id: tenantId, file_hash: fileHash },
+      null,
+      now,
+    );
+
+    db.prepare(`
+      INSERT INTO decision_events (
+        id, decision_id, type, source_type, status, actor_id, actor_type, actor_name, action_type,
+        evidence_id, evidence_level, chain_hash, chain_index, previous_hash, chain_domain,
+        occurred_at, tenant_id, created_at, updated_at
+      ) VALUES (?, ?, 'file_change', 'harness', 'recorded', ?, 'human', 'Someone', 'SYNC',
+                ?, 'DRAFT', ?, 0, NULL, ?, ?, ?, ?, ?)
+    `).run(id, `dec_drive_${domain}`, email, evidenceId, chainHash, domain, modifiedTime, tenantId, now, now);
+
+    db.prepare(`
+      INSERT INTO proof_files (id, tenant_id, decision_event_id, filename, size_bytes, file_hash, version_number, storage_path, storage_type, created_at)
+      VALUES (?, ?, ?, 'x.pdf', 1, ?, 1, 'x', 'local', ?)
+    `).run(crypto.randomUUID(), tenantId, id, fileHash, now);
+
+    return evidenceId;
+  }
+
+  it('🔴 구 drive 행이 거짓 실패하지 않는다 (actor_id·타임스탬프 둘 다 어긋나 있다)', async () => {
+    const evidenceId = insertLegacyDriveRow('drive-ok');
+    const { body } = await verify(evidenceId);
+
+    // 🔑 핵심은 "verified" 가 아니라 **변조로 몰지 않는 것**이다.
+    //    해시가 맞았다 = 기록 당시 입력을 찾아냈다 = 이 행은 변조되지 않았다.
+    assert.equal(body.checks.chainHash.ok, true, `멀쩡한 고객 데이터를 변조로 보고했다: ${JSON.stringify(body.failures)}`);
+    assert.equal(body.checks.chainHash.matchedScheme, 'proof.v2-drive');
+    assert.equal(body.checks.chainHash.contentBound, false);
+    assert.ok(
+      !body.failures.some((f: string) => /altered after recording/i.test(f)),
+      '변조됐다고 말하면 안 된다',
+    );
+  });
+
+  it('구 drive 행도 파일 해시를 바꾸면 잡힌다', async () => {
+    const evidenceId = insertLegacyDriveRow('drive-tampered');
+    const row = db.prepare('SELECT id FROM decision_events WHERE evidence_id = ?').get(evidenceId) as { id: string };
+    db.prepare('UPDATE proof_files SET file_hash = ? WHERE decision_event_id = ?').run('0'.repeat(64), row.id);
+
+    const { body } = await verify(evidenceId);
+    assert.equal(body.verified, false);
+  });
+
+  it('🔴 폴백은 drive 경로에만 열린다 — 일반 v2 행은 occurred_at 을 바꾸면 잡힌다', async () => {
+    // 폴백이 모든 v2 행에 열려 있으면, occurred_at 을 바꿔도 created_at 후보가 맞아 통과한다.
+    // 그건 구제가 아니라 변조 통로다.
+    //
+    // 이 행은 drive 경로가 아니다(source_type='manual'). 기록 당시 occurred_at 과 created_at 이
+    // 같았으므로, 폴백이 열려 있으면 occurred_at 을 바꿔도 created_at 후보로 통과해버린다.
+    const domain = 'v2-narrow';
+    const id = crypto.randomUUID();
+    const evidenceId = `evi_${domain}`;
+    const at = '2026-04-01T00:00:00.000Z';
+    const chainHash = computeChainHash(
+      { type: 'agent_execution', action_type: 'RUN', actor_id: 'legacy-agent' },
+      null,
+      at,
+    );
+    db.prepare(`
+      INSERT INTO decision_events (
+        id, decision_id, type, source_type, status, actor_id, actor_type, action_type,
+        evidence_id, evidence_level, chain_hash, chain_index, previous_hash, chain_domain,
+        occurred_at, tenant_id, created_at, updated_at
+      ) VALUES (?, ?, 'agent_execution', 'manual', 'recorded', 'legacy-agent', 'ai', 'RUN',
+                ?, 'DRAFT', ?, 0, NULL, ?, ?, 'tenant-test', ?, ?)
+    `).run(id, `dec_${domain}`, evidenceId, chainHash, domain, at, at, at);
+
+    assert.equal((await verify(evidenceId)).body.checks.chainHash.ok, true, '기준선부터 실패했다');
+
+    tamper(evidenceId, 'occurred_at', '2020-01-01T00:00:00.000Z');
+
+    const { body } = await verify(evidenceId);
+    assert.equal(body.checks.chainHash.ok, false, '일반 v2 행에 폴백이 열려 있다');
+    assert.ok(body.failures.some((f: string) => /altered after recording/i.test(f)));
   });
 });
 
