@@ -17,7 +17,8 @@
     "build": "npm run build --workspaces --if-present",
     "dev:api": "npm run dev --workspace=api-server",
     "dev:mcp": "npm run dev --workspace=mcp-server",
-    "typecheck": "npm run typecheck --workspaces --if-present"
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "test": "npm run test --workspaces --if-present"
   },
   "engines": {
     "node": ">=18.0.0"

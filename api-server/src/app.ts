@@ -151,6 +151,22 @@ app.get('/verify/:id', (c) => {
       'This endpoint proves that the record we hold is internally consistent and unaltered since recording.',
       'It is not third-party attestation: there is no RFC 3161 trusted timestamp and no external anchor yet.',
       'Server signature (when configured) lets you verify independently using the public key at /verify/public-key.',
+      // 🔴 꼬리 절단은 구조적으로 탐지 불가다. 마지막 N건을 지우면 남은 체인은
+      //    인덱스가 연속이고 링크도 맞아 "정상"으로 보인다. 안에서는 풀 수 없는 문제 —
+      //    체인의 머리를 밖에 박아두는 외부 앵커가 있어야 한다.
+      //    이걸 안 적으면 "verified"가 "아무것도 삭제되지 않았다"로 읽힌다.
+      'Truncation is not detectable: if the most recent records were deleted, the remaining chain still ' +
+        'verifies. Detecting a missing tail requires an external anchor, which is not implemented yet.',
+      // 🔴 v2 레코드의 "verified: true" 는 실제보다 훨씬 강하게 읽힌다.
+      //    해시가 3개 필드만 덮으므로 산출물·AI 근거·승인 결과는 결속되어 있지 않다.
+      //    이 사실을 조용히 두면 검증이 없는 것보다 나쁘다.
+      ...(result.checks.chainHash.contentBound === false
+        ? [
+            'WARNING: this is a legacy record. Its hash covers only the event type, action type and actor — ' +
+              'the outcome, AI reasoning and approval fields are NOT cryptographically bound. ' +
+              'Treat "verified" as "this record exists in the chain unmodified in those three fields" only.',
+          ]
+        : []),
     ],
   });
 });

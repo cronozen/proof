@@ -68,10 +68,33 @@ export interface Check {
   detail?: string;
 }
 
+export type ChainScheme = 'v2' | 'v3';
+
+/**
+ * 해시 검사 결과.
+ *
+ * 🔑 **라벨이 아니라 실제로 맞은 계산이 진실이다.** (thearound-ops 가 2026-07-31 codex
+ *    독립검증에서 얻은 규칙 — 저장된 버전 라벨만 보고 "내용까지 결속됨"이라 보고했다가
+ *    거짓 통과를 냈다. 검증이 없는 것보다 나쁜 상태다.)
+ *    그래서 `matchedScheme`은 저장된 `chain_payload_version`이 아니라 **실제로 일치한 빌더**다.
+ */
+export interface ChainHashCheck extends Check {
+  matchedScheme: ChainScheme | null;
+  /**
+   * 이 해시가 레코드 **내용**까지 덮는가.
+   *
+   * 🔴 v2는 `type`·`action_type`·`actor_id` 3개만 덮는다. 즉 v2 레코드는
+   *    `verified: true`여도 산출물·AI 근거·승인 결과를 바꿔치기할 수 있다.
+   *    이 값을 함께 내보내지 않으면 "verified"가 실제보다 훨씬 강하게 읽힌다.
+   *    해시가 안 맞았으면 단정하지 않고 null.
+   */
+  contentBound: boolean | null;
+}
+
 export interface VerificationResult {
   verified: boolean;
   checks: {
-    chainHash: Check;
+    chainHash: ChainHashCheck;
     chainLink: Check;
     seal: Check;
     serverSignature: SignatureCheck;
@@ -128,62 +151,98 @@ function chainTimestampCandidates(row: DecisionEventRow): string[] {
 
 // ─── 개별 검사 ──────────────────────────────────────────────────────
 
-function checkChainHash(db: Database, row: DecisionEventRow): Check {
+function checkChainHash(db: Database, row: DecisionEventRow): ChainHashCheck {
   if (!row.chain_hash) {
-    return { ok: false, detail: 'Record has no chain hash.' };
+    return { ok: false, matchedScheme: null, contentBound: null, detail: 'Record has no chain hash.' };
   }
 
+  const version = row.chain_payload_version ?? 2;
+  const scheme: ChainScheme = version >= 3 ? 'v3' : 'v2';
   const content = rebuildChainContent(db, row);
 
   for (const timestamp of chainTimestampCandidates(row)) {
     const recomputed = computeChainHash(content, row.previous_hash ?? null, timestamp);
-    if (recomputed === row.chain_hash) return { ok: true };
+    if (recomputed === row.chain_hash) {
+      return {
+        ok: true,
+        matchedScheme: scheme,
+        contentBound: scheme === 'v3',
+        detail:
+          scheme === 'v3'
+            ? undefined
+            : 'Legacy v2 record: the hash covers only type, action type and actor — the outcome, AI reasoning and approval fields are NOT bound by it.',
+      };
+    }
   }
 
   return {
     ok: false,
+    matchedScheme: null,
+    contentBound: null,
     detail: 'Recomputed hash does not match the stored chain hash — record content was altered after recording.',
   };
 }
 
 /**
- * 체인 연결.
+ * 체인 연결 — 앞뒤 **양방향**.
  *
  * chain_hash만 맞아도 **행 하나를 통째로 빼내는 것**은 잡히지 않는다.
  * 앞 레코드가 실제로 존재하고 그 해시가 previous_hash와 같은지까지 봐야 한다.
+ *
+ * 🔴 후행(next) 링크도 봐야 한다. 앞만 보면 **뒤가 끊겨도 "통과"**라고 답한다 —
+ *    thearound-ops가 2026-07-31 독립검증에서 정확히 이 구멍을 지적받고 조인 항목이다.
+ *    (ops PROD 실측: next_link 보유 43,898건 중 불일치 0건 → 조여도 뒤집히는 레코드가 없었다.)
+ *
+ * 링크는 3상태다: 대상이 **없으면**(체인의 끝/시작) null → 통과로 본다.
+ * 대상이 있는데 어긋나면 실패다. 없는 것과 어긋난 것을 같게 취급하면 둘 다 놓친다.
  */
 function checkChainLink(db: Database, row: DecisionEventRow): Check {
   const index = row.chain_index;
 
+  // ── 선행 링크 ──
   if (index === 0) {
     if (row.previous_hash) {
       return { ok: false, detail: 'Genesis record (index 0) must not reference a previous hash.' };
     }
-    return { ok: true, detail: 'Genesis record.' };
+  } else {
+    const previous = db
+      .prepare(
+        'SELECT chain_hash FROM decision_events WHERE chain_domain = ? AND tenant_id = ? AND chain_index = ?',
+      )
+      .get(row.chain_domain, row.tenant_id, index - 1) as { chain_hash: string | null } | undefined;
+
+    if (!previous) {
+      return { ok: false, detail: `Previous record at chain index ${index - 1} is missing — the chain has a gap.` };
+    }
+    if (!row.previous_hash) {
+      return { ok: false, detail: 'Record at a non-zero index carries no previous hash.' };
+    }
+    if (previous.chain_hash !== row.previous_hash) {
+      return {
+        ok: false,
+        detail: 'Previous hash does not match the actual preceding record — the chain was reordered or rewritten.',
+      };
+    }
   }
 
-  const previous = db
+  // ── 후행 링크 ──
+  const next = db
     .prepare(
-      'SELECT chain_hash FROM decision_events WHERE chain_domain = ? AND tenant_id = ? AND chain_index = ?',
+      'SELECT previous_hash FROM decision_events WHERE chain_domain = ? AND tenant_id = ? AND chain_index = ?',
     )
-    .get(row.chain_domain, row.tenant_id, index - 1) as { chain_hash: string | null } | undefined;
+    .get(row.chain_domain, row.tenant_id, index + 1) as { previous_hash: string | null } | undefined;
 
-  if (!previous) {
-    return { ok: false, detail: `Previous record at chain index ${index - 1} is missing — the chain has a gap.` };
-  }
-
-  if (!row.previous_hash) {
-    return { ok: false, detail: 'Record at a non-zero index carries no previous hash.' };
-  }
-
-  if (previous.chain_hash !== row.previous_hash) {
+  if (next && next.previous_hash !== row.chain_hash) {
     return {
       ok: false,
-      detail: 'Previous hash does not match the actual preceding record — the chain was reordered or rewritten.',
+      detail: 'The following record does not point back to this one — the chain was rewritten after this record.',
     };
   }
 
-  return { ok: true };
+  return {
+    ok: true,
+    detail: index === 0 ? 'Genesis record.' : undefined,
+  };
 }
 
 /**
@@ -284,6 +343,109 @@ export function verifyRecord(db: Database, row: DecisionEventRow): VerificationR
     },
     chainPayloadVersion: version,
     failures,
+  };
+}
+
+export interface ChainVerificationResult {
+  domain: string;
+  verified: boolean;
+  totalEvents: number;
+  scanned: number;
+  verifiedEvents: number;
+  /** 처음으로 깨진 체인 인덱스. 전부 정상이면 null. */
+  firstBrokenIndex: number | null;
+  /** 인덱스 연속성 — 중간에 빠진 레코드가 있으면 여기 담긴다. */
+  missingIndexes: number[];
+  records: {
+    chainIndex: number;
+    evidenceId: string | null;
+    verified: boolean;
+    failures: string[];
+  }[];
+  truncated: boolean;
+}
+
+/**
+ * 도메인 전체 체인 검증.
+ *
+ * 레코드 하나만 보는 `/verify/:id`와 달리, 체인 **전체**를 인덱스 순서대로 훑는다.
+ * 개별 레코드가 각자 정상이어도 중간이 통째로 빠져 있으면 체인은 깨진 것이다 —
+ * 그래서 인덱스 연속성을 따로 센다.
+ *
+ * 🔴 이 함수의 결과는 도메인명과 인덱스를 담으므로 **인증된 호출자에게만** 준다.
+ *    공개 검증(`/verify/:id`)과 같은 화이트리스트를 적용하면 체인 검증 자체가 무의미해진다.
+ */
+export function verifyChain(
+  db: Database,
+  params: { domain: string; tenantId: string; fromIndex?: number; toIndex?: number; limit?: number },
+): ChainVerificationResult {
+  const { domain, tenantId } = params;
+  const limit = Math.min(params.limit ?? COVERAGE_SCAN_LIMIT, COVERAGE_SCAN_LIMIT);
+
+  const total = (
+    db
+      .prepare('SELECT COUNT(*) as count FROM decision_events WHERE chain_domain = ? AND tenant_id = ?')
+      .get(domain, tenantId) as { count: number }
+  ).count;
+
+  const conditions = ['chain_domain = ?', 'tenant_id = ?'];
+  const args: unknown[] = [domain, tenantId];
+
+  if (params.fromIndex !== undefined) {
+    conditions.push('chain_index >= ?');
+    args.push(params.fromIndex);
+  }
+  if (params.toIndex !== undefined) {
+    conditions.push('chain_index <= ?');
+    args.push(params.toIndex);
+  }
+
+  const rows = db
+    .prepare(
+      `SELECT * FROM decision_events WHERE ${conditions.join(' AND ')} ORDER BY chain_index ASC LIMIT ?`,
+    )
+    .all(...args, limit) as DecisionEventRow[];
+
+  const records: ChainVerificationResult['records'] = [];
+  const missingIndexes: number[] = [];
+  let firstBrokenIndex: number | null = null;
+  let verifiedEvents = 0;
+  let expectedIndex = rows.length > 0 ? rows[0].chain_index : 0;
+
+  for (const row of rows) {
+    // 인덱스 건너뜀 = 레코드가 통째로 사라졌다는 뜻. 개별 검증은 통과할 수 있으므로 따로 잡는다.
+    while (row.chain_index > expectedIndex) {
+      missingIndexes.push(expectedIndex);
+      if (firstBrokenIndex === null) firstBrokenIndex = expectedIndex;
+      expectedIndex += 1;
+    }
+    expectedIndex = row.chain_index + 1;
+
+    const result = verifyRecord(db, row);
+    if (result.verified) {
+      verifiedEvents += 1;
+    } else if (firstBrokenIndex === null) {
+      firstBrokenIndex = row.chain_index;
+    }
+
+    records.push({
+      chainIndex: row.chain_index,
+      evidenceId: row.evidence_id,
+      verified: result.verified,
+      failures: result.failures,
+    });
+  }
+
+  return {
+    domain,
+    verified: firstBrokenIndex === null && missingIndexes.length === 0,
+    totalEvents: total,
+    scanned: rows.length,
+    verifiedEvents,
+    firstBrokenIndex,
+    missingIndexes,
+    records,
+    truncated: rows.length >= limit && total > rows.length,
   };
 }
 

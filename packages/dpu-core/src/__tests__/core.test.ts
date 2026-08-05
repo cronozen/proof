@@ -24,6 +24,7 @@ import {
 
 import {
   computeChainHash,
+  computeChainHashV1,
   generatePolicyHash,
   verifyPolicyHash,
   computeContentHash,
@@ -714,55 +715,119 @@ describe('@locked regression: canonicalize', () => {
       null,
       '2026-02-10T00:00:00+09:00'
     );
-    // Payload keys sorted: content < previousHash < timestamp
-    const expected = JSON.stringify({
-      content: { domain: 'pharmacy' },
-      previousHash: 'GENESIS',
-      timestamp: '2026-02-10T00:00:00+09:00',
-    }, ['content', 'previousHash', 'timestamp']);
-    assert.equal(result, expected);
+
+    // 🔴 2026-08-05 정정: 기존 기댓값은 `JSON.stringify(obj, ['content','previousHash','timestamp'])`
+    //    로 만들어져 있었다. 그건 **v1 의 문법**이고, replacer 배열이 모든 깊이에 적용되어
+    //    content 가 `{}` 로 뭉개진다 — 정확히 v2 가 고친 버그다.
+    //    v2 함수에 v1 기댓값을 걸어놓은 셈이라 이 테스트는 계속 빨간불이었다.
+    //    상시 빨간 테스트는 진짜 회귀가 와도 아무도 못 보게 만든다.
+    assert.equal(
+      result,
+      '{"content":{"domain":"pharmacy"},"previousHash":"GENESIS","timestamp":"2026-02-10T00:00:00+09:00"}',
+    );
   });
 });
 
+/**
+ * @locked regression: computeChainHash known vectors
+ *
+ * 🔴 2026-08-05: 이 블록은 **아무것도 고정하고 있지 않았다.**
+ *
+ * 기존 구현은 기댓값을 `sha256(canonicalizeChainPayload(...))` 로 계산했다.
+ * 즉 검사 대상과 기댓값을 **같은 함수**로 만들었다. 직렬화 규칙을 바꾸면 양쪽이 똑같이
+ * 바뀌므로 이 테스트는 절대 깨지지 않는다 — 주석에는 "any change to serialization
+ * breaks this test" 라고 적혀 있었지만 사실이 아니었다.
+ *
+ * 해시 고정은 **리터럴 값**으로만 성립한다. 아래 값들은 실제 구현으로 산출해 박아둔 것이다.
+ * 이 값이 바뀌면 기존에 기록된 모든 체인 해시가 무효가 된다는 뜻이므로, 고쳐서 초록으로
+ * 만들지 말고 왜 바뀌었는지부터 물어야 한다.
+ */
 describe('@locked regression: computeChainHash known vectors', () => {
-  // Pre-computed test vector #1: Genesis hash for pharmacy domain
+  // Vector #1: Genesis hash for pharmacy domain
+  // payload: {"content":{"domain":"pharmacy","final_action":"CREATED","final_responsible":"kim","purpose":"교품거래"},"previousHash":"GENESIS","timestamp":"2026-02-10T00:00:00+09:00"}
   it('genesis hash vector #1', () => {
     const content = { domain: 'pharmacy', final_action: 'CREATED', final_responsible: 'kim', purpose: '교품거래' };
     const ts = '2026-02-10T00:00:00+09:00';
-    const hash = computeChainHash(content, null, ts);
 
-    // Manually compute expected hash:
-    const payload = canonicalizeChainPayload(content, null, ts);
-    const expected = sha256(payload);
-    assert.equal(hash, expected);
-
-    // Pin the actual value so any change to serialization breaks this test
-    // The payload is: {"content":{"domain":"pharmacy","final_action":"CREATED","final_responsible":"kim","purpose":"교품거래"},"previousHash":"GENESIS","timestamp":"2026-02-10T00:00:00+09:00"}
-    // Note: content keys ordered by the replacer which uses the payload's top-level keys
-    assert.equal(hash, expected, `Pinned hash: ${expected}`);
+    assert.equal(
+      computeChainHash(content, null, ts),
+      '3b0d36b5fbbb16489cbc69582446e39dcce70390d3698f7ef780bf698b815b85',
+    );
   });
 
-  // Pre-computed test vector #2: Chained hash
+  // Vector #2: Chained hash
+  // payload: {"content":{"domain":"edu","purpose":"수업평가"},"previousHash":"aaaa…","timestamp":"2026-03-01T12:00:00Z"}
   it('chained hash vector #2', () => {
     const content = { domain: 'edu', purpose: '수업평가' };
     const prevHash = 'a'.repeat(64);
     const ts = '2026-03-01T12:00:00Z';
-    const hash = computeChainHash(content, prevHash, ts);
 
-    const payload = canonicalizeChainPayload(content, prevHash, ts);
-    const expected = sha256(payload);
-    assert.equal(hash, expected);
+    assert.equal(
+      computeChainHash(content, prevHash, ts),
+      '3a0dac6ea463b67359bf18962479e45775b6616388b3de68a1554f33e1e92221',
+    );
   });
 
-  // Test vector #3: minimal content
+  // Vector #3: minimal content
+  // payload: {"content":{},"previousHash":"GENESIS","timestamp":"2026-01-01T00:00:00Z"}
   it('minimal content hash vector #3', () => {
-    const content = {};
-    const ts = '2000-01-01T00:00:00Z';
-    const hash = computeChainHash(content, null, ts);
+    assert.equal(
+      computeChainHash({}, null, '2026-01-01T00:00:00Z'),
+      'adc06d602cc7d1e3a8485e29b4f35bf8f4d20621673521468e9c0df6a3d4dd98',
+    );
+  });
 
-    const payload = canonicalizeChainPayload(content, null, ts);
-    const expected = sha256(payload);
-    assert.equal(hash, expected);
+  // 기댓값이 구현과 독립적인지 확인한다 — 위 리터럴들이 진짜 고정값이라는 증거.
+  it('pinned vectors are literals, not recomputed from the implementation', () => {
+    const content = { domain: 'pharmacy', final_action: 'CREATED', final_responsible: 'kim', purpose: '교품거래' };
+    const ts = '2026-02-10T00:00:00+09:00';
+
+    // 직렬화 규칙을 손으로 재현한 문자열 → 해시. 구현 함수를 부르지 않는다.
+    const handWritten =
+      '{"content":{"domain":"pharmacy","final_action":"CREATED","final_responsible":"kim","purpose":"교품거래"},"previousHash":"GENESIS","timestamp":"2026-02-10T00:00:00+09:00"}';
+
+    assert.equal(sha256(handWritten), computeChainHash(content, null, ts));
+  });
+});
+
+/**
+ * @locked regression: v1 레거시 벡터
+ *
+ * v1 은 `JSON.stringify(payload, ['content','previousHash','timestamp'])` 를 쓴다.
+ * replacer 배열은 **모든 깊이**에 적용되므로 content 의 키가 전부 탈락해 항상 `{}` 가 된다.
+ * 즉 **내용이 달라도 같은 해시가 나온다** — 이것이 v2 를 만든 이유다.
+ *
+ * 그럼에도 v1 을 고정해 두는 이유: 2026-08 현재 thearound-ops 가 레거시 DPU 를 검증할 때
+ * 여전히 이 계산을 후보로 쓴다. 여기서 값이 흔들리면 살아 있는 레코드가 검증에 실패한다.
+ */
+describe('@locked regression: computeChainHashV1 legacy vectors', () => {
+  it('v1 collapses content to {} — different content, same hash', () => {
+    const ts = '2026-02-10T00:00:00+09:00';
+    const a = computeChainHashV1({ domain: 'pharmacy' }, null, ts);
+    const b = computeChainHashV1(
+      { domain: 'pharmacy', final_action: 'CREATED', final_responsible: 'kim', purpose: '교품거래' },
+      null,
+      ts,
+    );
+
+    assert.equal(a, 'cc36afc2fa4765e515e6be91206b181229cf8a76d9551e0003a8cafee282fc47');
+    assert.equal(a, b, 'v1 이 내용을 덮지 않는다는 사실 자체가 고정 대상이다');
+  });
+
+  it('v1 chained vector', () => {
+    assert.equal(
+      computeChainHashV1({ domain: 'edu', purpose: '수업평가' }, 'a'.repeat(64), '2026-03-01T12:00:00Z'),
+      'ccce2f94bf10306c8152912b2d6bead3a4e294223095f1c142de17b6dd664425',
+    );
+  });
+
+  it('v1 and v2 agree only when content is empty', () => {
+    const ts = '2026-01-01T00:00:00Z';
+    assert.equal(computeChainHash({}, null, ts), computeChainHashV1({}, null, ts));
+    assert.notEqual(
+      computeChainHash({ action: 'test' }, null, ts),
+      computeChainHashV1({ action: 'test' }, null, ts),
+    );
   });
 });
 
@@ -803,20 +868,13 @@ describe('@locked regression: pinned hash values', () => {
   });
 
   it('genesis chain hash for fixed content/timestamp is pinned', () => {
-    const content = { action: 'test' };
-    const ts = '2026-01-01T00:00:00Z';
-
-    // The canonical payload is:
-    // {"content":{"action":"test"},"previousHash":"GENESIS","timestamp":"2026-01-01T00:00:00Z"}
-    // But we must account for the replacer: Object.keys(payload).sort() = ['content', 'previousHash', 'timestamp']
-    // and the content object's keys aren't sorted by the top-level replacer
-    // (they are included because the array replacer applies at all levels).
-    const expectedPayload = JSON.stringify(
-      { content: { action: 'test' }, previousHash: 'GENESIS', timestamp: '2026-01-01T00:00:00Z' },
-      ['content', 'previousHash', 'timestamp']
+    // canonical payload: {"content":{"action":"test"},"previousHash":"GENESIS","timestamp":"2026-01-01T00:00:00Z"}
+    //
+    // 🔴 2026-08-05 정정: 기존 기댓값은 replacer 배열(v1 문법)로 만들어져 content 가 `{}` 로
+    //    뭉개진 문자열을 해시했다. v2 함수와 맞을 리 없어 계속 실패하고 있었다.
+    assert.equal(
+      computeChainHash({ action: 'test' }, null, '2026-01-01T00:00:00Z'),
+      'c2d4269d1c6356c8bb871a9347017e1231d0e74b65c3503febf0d31d83c1e5d5',
     );
-    const expectedHash = sha256(expectedPayload);
-    const actualHash = computeChainHash(content, null, ts);
-    assert.equal(actualHash, expectedHash);
   });
 });

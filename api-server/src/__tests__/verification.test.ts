@@ -185,6 +185,23 @@ describe('결함주입 — 체인 구조', () => {
     assert.match(body.checks.chainLink.detail, /missing|gap/i);
   });
 
+  it('뒤 레코드가 나를 안 가리키면 잡는다 (후행 링크 — 앞만 보면 통과했던 구멍)', async () => {
+    const domain = 'next-link';
+    const first = await recordEvent({ metadata: { domain } });
+    const second = await recordEvent({ metadata: { domain } });
+
+    // 첫 레코드는 이 시점에 정상
+    assert.equal((await verify(first.evidence.id)).body.checks.chainLink.ok, true);
+
+    // 후속 레코드의 previous_hash 를 다른 값으로 — 첫 레코드 자체는 손대지 않는다.
+    tamper(second.evidence.id, 'previous_hash', 'b'.repeat(64));
+
+    const { body } = await verify(first.evidence.id);
+    assert.equal(body.verified, false, '후행 링크를 안 보면 여기서 통과한다');
+    assert.equal(body.checks.chainLink.ok, false);
+    assert.match(body.checks.chainLink.detail, /following record/i);
+  });
+
   it('previous_hash를 다른 값으로 바꾸면 연결 검사가 깨진다', async () => {
     await recordEvent();
     const target = await recordEvent();
@@ -364,6 +381,88 @@ describe('공개 필드 화이트리스트', () => {
   });
 });
 
+// ─── 체인 전체 검증 ─────────────────────────────────────────────────
+
+describe('체인 전체 검증 (/decision-events/verify-chain/:domain)', () => {
+  async function get(url: string, withAuth = true) {
+    const res = await app.fetch(
+      new Request(`http://localhost${url}`, {
+        headers: withAuth ? { Authorization: `Bearer ${API_KEY}` } : {},
+      }),
+    );
+    return { status: res.status, body: (await res.json()) as any };
+  }
+
+  it('정상 체인은 verified=true, firstBrokenIndex=null', async () => {
+    const domain = 'chain-ok';
+    for (let i = 0; i < 3; i += 1) await recordEvent({ metadata: { domain } });
+
+    const { status, body } = await get(`/decision-events/verify-chain/${domain}`);
+    assert.equal(status, 200);
+    assert.equal(body.data.verified, true, JSON.stringify(body.data.records));
+    assert.equal(body.data.firstBrokenIndex, null);
+    assert.equal(body.data.totalEvents, 3);
+    assert.equal(body.data.verifiedEvents, 3);
+  });
+
+  it('중간 레코드를 지우면 인덱스 구멍을 잡는다 (개별 검증만으로는 안 잡힌다)', async () => {
+    const domain = 'chain-gap';
+    const events = [];
+    for (let i = 0; i < 3; i += 1) events.push(await recordEvent({ metadata: { domain } }));
+
+    // 가운데(index 1) 제거
+    db.prepare('DELETE FROM decision_events WHERE evidence_id = ?').run(events[1].evidence.id);
+
+    const { body } = await get(`/decision-events/verify-chain/${domain}`);
+    assert.equal(body.data.verified, false);
+    assert.deepEqual(body.data.missingIndexes, [1]);
+    assert.equal(body.data.firstBrokenIndex, 1);
+  });
+
+  it('레코드를 변조하면 그 인덱스를 짚어준다', async () => {
+    const domain = 'chain-tampered';
+    const events = [];
+    for (let i = 0; i < 3; i += 1) events.push(await recordEvent({ metadata: { domain } }));
+
+    tamper(events[2].evidence.id, 'action_output', JSON.stringify({ payout: 99_000_000 }));
+
+    const { body } = await get(`/decision-events/verify-chain/${domain}`);
+    assert.equal(body.data.verified, false);
+    assert.equal(body.data.firstBrokenIndex, 2);
+    assert.equal(body.data.verifiedEvents, 2);
+  });
+
+  it('인증 없이는 접근할 수 없다 (도메인명이 드러난다)', async () => {
+    const domain = 'chain-private';
+    await recordEvent({ metadata: { domain } });
+
+    const { status } = await get(`/decision-events/verify-chain/${domain}`, false);
+    assert.equal(status, 401);
+  });
+
+  it('다른 테넌트의 체인은 보이지 않는다', async () => {
+    const domain = 'chain-other-tenant';
+    await recordEvent({ metadata: { domain } });
+
+    const otherKey = createApiKey('tenant-other', 'other tenant key').key;
+    const res = await app.fetch(
+      new Request(`http://localhost/decision-events/verify-chain/${domain}`, {
+        headers: { Authorization: `Bearer ${otherKey}` },
+      }),
+    );
+    assert.equal(res.status, 404);
+  });
+
+  it('verify-chain 라우트가 /:id 보다 먼저 잡힌다 (라우트 순서 회귀 방지)', async () => {
+    const domain = 'chain-route-order';
+    await recordEvent({ metadata: { domain } });
+
+    const { status, body } = await get(`/decision-events/verify-chain/${domain}`);
+    assert.equal(status, 200);
+    assert.ok(body.data?.records, 'verify-chain was swallowed by the /:id route');
+  });
+});
+
 // ─── 레거시 v2 행 ──────────────────────────────────────────────────
 
 describe('레거시 v2 레코드 (2026-08-05 이전 기록)', () => {
@@ -403,6 +502,30 @@ describe('레거시 v2 레코드 (2026-08-05 이전 기록)', () => {
     assert.equal(body.checks.serverSignature.status, 'not_applicable');
   });
 
+  it('v2 행의 verified=true 는 "내용까지 결속됨"을 뜻하지 않는다 — contentBound로 말한다', async () => {
+    const evidenceId = insertLegacyRow('legacy-contentbound');
+    const { body } = await verify(evidenceId);
+
+    assert.equal(body.verified, true);
+    // 라벨이 아니라 실제로 맞은 계산을 보고한다
+    assert.equal(body.checks.chainHash.matchedScheme, 'v2');
+    assert.equal(body.checks.chainHash.contentBound, false);
+    // 응답을 읽는 사람이 과신하지 않도록 경고를 함께 내보낸다
+    assert.ok(
+      body.limitations.some((l: string) => /legacy record/i.test(l)),
+      'legacy 경고가 limitations 에 없다',
+    );
+  });
+
+  it('v3 행은 contentBound=true 로 보고한다', async () => {
+    const event = await recordEvent();
+    const { body } = await verify(event.evidence.id);
+
+    assert.equal(body.checks.chainHash.matchedScheme, 'v3');
+    assert.equal(body.checks.chainHash.contentBound, true);
+    assert.ok(!body.limitations.some((l: string) => /legacy record/i.test(l)));
+  });
+
   it('v2 행도 변조하면 잡힌다 (레거시라고 봐주지 않는다)', async () => {
     const evidenceId = insertLegacyRow('legacy-tampered');
     tamper(evidenceId, 'actor_id', 'someone-else');
@@ -410,6 +533,50 @@ describe('레거시 v2 레코드 (2026-08-05 이전 기록)', () => {
     const { body } = await verify(evidenceId);
     assert.equal(body.verified, false);
     assert.equal(body.checks.chainHash.ok, false);
+  });
+});
+
+// ─── 체인 위치 유일성 ───────────────────────────────────────────────
+
+describe('체인 위치 유일성 (동시 append 방어)', () => {
+  it('같은 (tenant, domain, index)를 두 번 넣을 수 없다', async () => {
+    const domain = 'unique-position';
+    const event = await recordEvent({ metadata: { domain } });
+
+    const row = db
+      .prepare('SELECT * FROM decision_events WHERE evidence_id = ?')
+      .get(event.evidence.id) as Record<string, unknown>;
+
+    // 같은 체인 위치에 다른 레코드를 끼워 넣으려는 시도 = 체인 분기
+    assert.throws(
+      () => {
+        db.prepare(`
+          INSERT INTO decision_events (
+            id, decision_id, type, source_type, status, actor_id, actor_type, action_type,
+            evidence_id, chain_index, chain_domain, occurred_at, tenant_id, created_at, updated_at
+          ) VALUES (?, ?, 'ai_decision', 'manual', 'recorded', 'x', 'ai', 'FORK',
+                    ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          crypto.randomUUID(), `dec_fork_${domain}`, `evi_fork_${domain}`,
+          row.chain_index, domain, row.occurred_at, row.tenant_id, row.created_at, row.created_at,
+        );
+      },
+      /UNIQUE/i,
+      '체인 분기가 DB 제약에 막히지 않았다',
+    );
+  });
+
+  it('연속 기록이 인덱스를 건너뛰지 않는다', async () => {
+    const domain = 'sequential-append';
+    for (let i = 0; i < 5; i += 1) await recordEvent({ metadata: { domain } });
+
+    const indexes = (
+      db
+        .prepare('SELECT chain_index FROM decision_events WHERE chain_domain = ? ORDER BY chain_index')
+        .all(domain) as { chain_index: number }[]
+    ).map(r => r.chain_index);
+
+    assert.deepEqual(indexes, [0, 1, 2, 3, 4]);
   });
 });
 

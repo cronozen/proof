@@ -119,15 +119,9 @@ filesRouter.post('/upload', async (c) => {
   const evidenceId = `evi_${crypto.randomUUID().replace(/-/g, '').slice(0, 16)}`;
   const now = new Date().toISOString();
 
-  // 체인 해시 계산
-  const lastInChain = db
-    .prepare('SELECT chain_hash, chain_index FROM decision_events WHERE chain_domain = ? AND tenant_id = ? ORDER BY chain_index DESC LIMIT 1')
-    .get(domain, auth.tenantId) as { chain_hash: string; chain_index: number } | undefined;
-
-  const previousHash = lastInChain?.chain_hash || null;
-  const chainIndex = (lastInChain?.chain_index ?? -1) + 1;
-
   // 🔑 컬럼값을 먼저 확정 → 그 객체에서 해시. 검증기가 DB 행을 같은 빌더에 넣는다.
+  //    chain_index / previous_hash 는 아래 트랜잭션 안에서 채운다 — 체인의 끝은
+  //    읽는 순간과 쓰는 순간 사이에 움직일 수 있다.
   //    파일 이벤트는 file_hash가 action_metadata 안에 들어가므로 그 JSON 문자열이 해시에 묶인다.
   const eventCols = {
     id: eventId,
@@ -165,8 +159,8 @@ filesRouter.post('/upload', async (c) => {
 
     evidence_id: evidenceId,
     evidence_level: 'DRAFT',
-    chain_index: chainIndex,
-    previous_hash: previousHash,
+    chain_index: -1,                      // 트랜잭션 안에서 확정
+    previous_hash: null as string | null, // 〃
     chain_domain: domain,
 
     occurred_at: now,
@@ -179,13 +173,6 @@ filesRouter.post('/upload', async (c) => {
     updated_at: now,
   };
 
-  const chainHash = computeChainHash(
-    buildChainContentV3(eventCols),
-    previousHash,
-    eventCols.occurred_at,
-  );
-
-  const sig = signRecord(chainHash, null);
 
   // diff 요약 (이전 버전이 있으면)
   const diffSummary = previousVersion
@@ -233,7 +220,30 @@ filesRouter.post('/upload', async (c) => {
     )
   `);
 
+  // 🔴 체인의 끝 읽기도 이 트랜잭션 **안**에 있어야 한다. 밖에서 읽으면 동시 업로드 둘이
+  //    같은 chain_index 를 받아 체인이 조용히 갈라진다. `.immediate()` 로 시작 시점에
+  //    쓰기 락을 잡는다(기본 deferred 는 첫 쓰기까지 락을 미뤄 read-then-write 경합을 못 막는다).
+  // 응답에 실어 보낼 체인 값. 트랜잭션 안에서 확정되므로 밖에서 받아둔다.
+  let insertedChainHash = '';
+
   const transaction = db.transaction(() => {
+    const lastInChain = db
+      .prepare(
+        'SELECT chain_hash, chain_index FROM decision_events WHERE chain_domain = ? AND tenant_id = ? ORDER BY chain_index DESC LIMIT 1',
+      )
+      .get(domain, auth.tenantId) as { chain_hash: string; chain_index: number } | undefined;
+
+    eventCols.previous_hash = lastInChain?.chain_hash || null;
+    eventCols.chain_index = (lastInChain?.chain_index ?? -1) + 1;
+
+    const chainHash = computeChainHash(
+      buildChainContentV3(eventCols),
+      eventCols.previous_hash,
+      eventCols.occurred_at,
+    );
+    const sig = signRecord(chainHash, null);
+    insertedChainHash = chainHash;
+
     insertFile.run(
       fileId, auth.tenantId, eventId,
       file.name, file.type || null, buffer.length, fileHash,
@@ -252,7 +262,7 @@ filesRouter.post('/upload', async (c) => {
     });
   });
 
-  transaction();
+  transaction.immediate();
 
   // 7. 응답
   return c.json({
@@ -270,9 +280,9 @@ filesRouter.post('/upload', async (c) => {
       proof: {
         decisionId,
         evidenceId,
-        chainHash,
-        chainIndex,
-        previousHash,
+        chainHash: insertedChainHash,
+        chainIndex: eventCols.chain_index,
+        previousHash: eventCols.previous_hash,
         domain,
         type: 'file_change',
         sourceType: 'manual',

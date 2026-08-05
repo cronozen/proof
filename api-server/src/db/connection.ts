@@ -72,4 +72,49 @@ export function initializeDatabase(database: Database.Database): void {
   }
 
   database.exec(SCHEMA_SQL);
+
+  enforceChainUniqueness(database);
+}
+
+/**
+ * 체인 위치 유일성 — 같은 (tenant, domain, index)가 두 번 존재할 수 없게 한다.
+ *
+ * 쓰기 경로는 트랜잭션으로 경합을 막지만, 그건 **이 프로세스 안에서만** 참이다.
+ * 여러 인스턴스·수동 INSERT·복구 스크립트까지 덮는 최후 방어선은 DB 제약뿐이다.
+ * 체인이 갈라지면 앞뒤 링크 조회가 비결정적이 되고, 검증기가 같은 레코드에 대해
+ * 실행할 때마다 다른 답을 낸다 — 감사에서 최악의 실패 방식이다.
+ *
+ * 🔴 이미 중복이 있으면 인덱스 생성이 실패한다. 그때는 **조용히 넘어가지 않는다.**
+ *    중복을 그대로 두는 것보다 나쁜 건, 중복이 있다는 사실을 모르는 것이다.
+ *    (부팅은 막지 않는다 — 여기서 죽이면 기존 배포가 통째로 못 뜬다.
+ *     대신 무엇이 중복인지 로그로 정확히 말한다.)
+ */
+function enforceChainUniqueness(database: Database.Database): void {
+  try {
+    database.exec(
+      'CREATE UNIQUE INDEX IF NOT EXISTS idx_decision_events_chain_position ' +
+        'ON decision_events(tenant_id, chain_domain, chain_index)',
+    );
+  } catch (err) {
+    const duplicates = database
+      .prepare(
+        `SELECT tenant_id, chain_domain, chain_index, COUNT(*) as count
+         FROM decision_events
+         GROUP BY tenant_id, chain_domain, chain_index
+         HAVING count > 1
+         ORDER BY count DESC
+         LIMIT 20`,
+      )
+      .all() as { tenant_id: string; chain_domain: string; chain_index: number; count: number }[];
+
+    console.error('');
+    console.error('🔴 CHAIN INTEGRITY: could not enforce unique chain positions.');
+    console.error(`   ${(err as Error).message}`);
+    console.error(`   ${duplicates.length} duplicated chain position(s) found (showing up to 20):`);
+    for (const d of duplicates) {
+      console.error(`   - tenant=${d.tenant_id} domain=${d.chain_domain} index=${d.chain_index} count=${d.count}`);
+    }
+    console.error('   Verification results for these records are non-deterministic until resolved.');
+    console.error('');
+  }
 }

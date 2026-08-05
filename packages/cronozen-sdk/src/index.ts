@@ -40,6 +40,13 @@ export type {
   ApprovalResponse,
   EvidenceResponse,
   EvidenceExportResponse,
+  // Verification
+  VerificationResponse,
+  VerificationCheck,
+  SignatureStatus,
+  ChainVerificationOptions,
+  ChainVerificationResponse,
+  PublicKeyResponse,
 } from './types';
 
 export {

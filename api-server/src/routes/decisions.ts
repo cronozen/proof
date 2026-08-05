@@ -16,6 +16,7 @@ import {
   buildSealContent,
 } from '../lib/chain-content.js';
 import { signRecord } from '../lib/signing.js';
+import { verifyChain } from '../lib/verification.js';
 import type { AuthContext } from '../middleware/auth.js';
 import type { QuotaInfo } from '../middleware/quota.js';
 
@@ -68,14 +69,6 @@ decisionsRouter.post('/', async (c) => {
   const now = new Date().toISOString();
   const chainDomain = metadata?.domain || 'default';
 
-  // 해시 체인 계산
-  const lastInChain = db
-    .prepare('SELECT chain_hash, chain_index FROM decision_events WHERE chain_domain = ? AND tenant_id = ? ORDER BY chain_index DESC LIMIT 1')
-    .get(chainDomain, auth.tenantId) as { chain_hash: string; chain_index: number } | undefined;
-
-  const previousHash = lastInChain?.chain_hash || null;
-  const chainIndex = (lastInChain?.chain_index ?? -1) + 1;
-
   const evidenceId = `evi_${crypto.randomUUID().replace(/-/g, '').slice(0, 16)}`;
 
   // source_type 자동 추론: aiContext가 있으면 'ai', 명시적 값 우선
@@ -86,6 +79,9 @@ decisionsRouter.post('/', async (c) => {
   //    검증기(lib/verification.ts)는 DB 행을 같은 빌더에 넣으므로,
   //    기록 시점과 검증 시점의 입력이 같은 모양임이 구조적으로 보장된다.
   //    해시를 별도 리터럴로 따로 계산하면 바로 여기서 두 경로가 갈라진다.
+  //
+  //    chain_index / previous_hash 는 트랜잭션 안에서 채운다(아래) — 체인의 끝은
+  //    읽는 순간과 쓰는 순간 사이에 움직일 수 있는 값이라 여기서 확정하면 안 된다.
   const cols = {
     id,
     decision_id: decisionId,
@@ -115,8 +111,8 @@ decisionsRouter.post('/', async (c) => {
 
     evidence_id: evidenceId,
     evidence_level: 'DRAFT',
-    chain_index: chainIndex,
-    previous_hash: previousHash,
+    chain_index: -1,        // 트랜잭션 안에서 확정
+    previous_hash: null as string | null, // 〃
     chain_domain: chainDomain,
 
     occurred_at: occurredAt || now,
@@ -130,16 +126,7 @@ decisionsRouter.post('/', async (c) => {
     updated_at: now,
   };
 
-  const chainHash = computeChainHash(
-    buildChainContentV3(cols),
-    previousHash,
-    cols.occurred_at,
-  );
-
-  // 서명 키가 없으면 null — 서명한 척하지 않는다. 검증 응답이 그 상태를 그대로 말한다.
-  const sig = signRecord(chainHash, null);
-
-  db.prepare(`
+  const insertStatement = db.prepare(`
     INSERT INTO decision_events (
       id, decision_id, type, source_type, status,
       actor_id, actor_type, actor_name, actor_metadata,
@@ -161,14 +148,49 @@ decisionsRouter.post('/', async (c) => {
       @occurred_at, @tags, @metadata, @idempotency_key,
       @tenant_id, @api_key_id, @created_at, @updated_at
     )
-  `).run({
-    ...cols,
-    chain_hash: chainHash,
-    chain_payload_version: CHAIN_PAYLOAD_VERSION,
-    signature: sig?.signature ?? null,
-    signature_alg: sig?.alg ?? null,
-    signature_key_id: sig?.keyId ?? null,
+  `);
+
+  /**
+   * 🔴 체인의 끝을 읽고 이어붙이는 것은 **한 트랜잭션 안에서** 일어나야 한다.
+   *
+   * 읽기와 쓰기가 갈라져 있으면 동시 요청 둘이 같은 `chain_index`와 같은 `previous_hash`를
+   * 받아 체인이 조용히 갈라진다. 그러면 앞뒤 링크 조회가 비결정적이 되고,
+   * 검증기는 같은 레코드에 대해 실행할 때마다 다른 답을 낼 수 있다 — 감사에서 최악이다.
+   *
+   * `.immediate()`는 트랜잭션 시작 시점에 쓰기 락을 잡는다. 기본(deferred)은 첫 쓰기까지
+   * 락을 미루므로 read-then-write 경합을 막지 못한다.
+   * (DB의 UNIQUE(tenant_id, chain_domain, chain_index) 인덱스가 최후 방어선이다.)
+   */
+  const appendToChain = db.transaction(() => {
+    const lastInChain = db
+      .prepare(
+        'SELECT chain_hash, chain_index FROM decision_events WHERE chain_domain = ? AND tenant_id = ? ORDER BY chain_index DESC LIMIT 1',
+      )
+      .get(chainDomain, auth.tenantId) as { chain_hash: string; chain_index: number } | undefined;
+
+    cols.previous_hash = lastInChain?.chain_hash || null;
+    cols.chain_index = (lastInChain?.chain_index ?? -1) + 1;
+
+    const chainHash = computeChainHash(
+      buildChainContentV3(cols),
+      cols.previous_hash,
+      cols.occurred_at,
+    );
+
+    // 서명 키가 없으면 null — 서명한 척하지 않는다. 검증 응답이 그 상태를 그대로 말한다.
+    const sig = signRecord(chainHash, null);
+
+    insertStatement.run({
+      ...cols,
+      chain_hash: chainHash,
+      chain_payload_version: CHAIN_PAYLOAD_VERSION,
+      signature: sig?.signature ?? null,
+      signature_alg: sig?.alg ?? null,
+      signature_key_id: sig?.keyId ?? null,
+    });
   });
+
+  appendToChain.immediate();
 
   const inserted = db.prepare('SELECT * FROM decision_events WHERE id = ?').get(id);
   const quota = c.get('quota');
@@ -205,6 +227,47 @@ decisionsRouter.get('/', async (c) => {
     data: rows.map(formatEvent),
     pagination: { total, limit, offset, hasMore: offset + limit < total },
   });
+});
+
+// ─── GET /decision-events/verify-chain/:domain ─────────────────────
+
+/**
+ * 도메인 전체 체인 검증.
+ *
+ * `/verify/:id`는 레코드 하나만 본다. 개별 레코드가 각자 정상이어도 중간이 통째로
+ * 빠져 있으면 체인은 깨진 것이다 — 그 판정은 여기서 한다.
+ *
+ * ⚠️ `/:id` 라우트보다 **먼저** 선언해야 한다. 뒤에 두면 'verify-chain'을
+ *    decision id 로 조회하고 404가 난다.
+ *
+ * 🔴 인증 필수(tenant 스코핑). 응답이 도메인명과 인덱스를 담기 때문에 공개할 수 없다.
+ */
+decisionsRouter.get('/verify-chain/:domain', async (c) => {
+  const auth = c.get('auth');
+  const domain = c.req.param('domain');
+
+  const parseIndex = (raw: string | undefined): number | undefined => {
+    if (raw === undefined) return undefined;
+    const value = parseInt(raw, 10);
+    return Number.isFinite(value) ? value : undefined;
+  };
+
+  const result = verifyChain(getDB(), {
+    domain,
+    tenantId: auth.tenantId,
+    fromIndex: parseIndex(c.req.query('fromIndex')),
+    toIndex: parseIndex(c.req.query('toIndex')),
+    limit: parseIndex(c.req.query('limit')),
+  });
+
+  if (result.totalEvents === 0) {
+    return c.json(
+      { error: { code: 'NOT_FOUND', message: `No records found for chain domain '${domain}'` } },
+      404,
+    );
+  }
+
+  return c.json({ data: result });
 });
 
 // ─── GET /decision-events/:id ──────────────────────────────────────

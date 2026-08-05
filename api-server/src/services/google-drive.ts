@@ -347,14 +347,6 @@ async function processFileChange(
   const decisionId = `dec_${crypto.randomUUID().replace(/-/g, '').slice(0, 16)}`;
   const evidenceId = `evi_${crypto.randomUUID().replace(/-/g, '').slice(0, 16)}`;
 
-  // 체인 해시
-  const lastInChain = db
-    .prepare('SELECT chain_hash, chain_index FROM decision_events WHERE chain_domain = ? AND tenant_id = ? ORDER BY chain_index DESC LIMIT 1')
-    .get(chainDomain, tenantId) as { chain_hash: string; chain_index: number } | undefined;
-
-  const previousHash = lastInChain?.chain_hash || null;
-  const chainIndex = (lastInChain?.chain_index ?? -1) + 1;
-
   const diffSummary = previousVersion
     ? JSON.stringify({
         previousHash: previousVersion.file_hash,
@@ -411,8 +403,8 @@ async function processFileChange(
 
     evidence_id: evidenceId,
     evidence_level: 'DRAFT',
-    chain_index: chainIndex,
-    previous_hash: previousHash,
+    chain_index: -1,                      // 트랜잭션 안에서 확정
+    previous_hash: null as string | null, // 〃
     chain_domain: chainDomain,
 
     occurred_at: occurredAt,
@@ -424,15 +416,25 @@ async function processFileChange(
     updated_at: now,
   };
 
-  const chainHash = computeChainHash(
-    buildChainContentV3(eventCols),
-    previousHash,
-    eventCols.occurred_at,
-  );
-
-  const sig = signRecord(chainHash, null);
-
+  // 🔴 체인의 끝 읽기는 트랜잭션 **안**이어야 한다. 웹훅은 동시에 여러 번 들어올 수 있고,
+  //    밖에서 읽으면 같은 chain_index 가 둘 생겨 체인이 조용히 갈라진다.
   const transaction = db.transaction(() => {
+    const lastInChain = db
+      .prepare(
+        'SELECT chain_hash, chain_index FROM decision_events WHERE chain_domain = ? AND tenant_id = ? ORDER BY chain_index DESC LIMIT 1',
+      )
+      .get(chainDomain, tenantId) as { chain_hash: string; chain_index: number } | undefined;
+
+    eventCols.previous_hash = lastInChain?.chain_hash || null;
+    eventCols.chain_index = (lastInChain?.chain_index ?? -1) + 1;
+
+    const chainHash = computeChainHash(
+      buildChainContentV3(eventCols),
+      eventCols.previous_hash,
+      eventCols.occurred_at,
+    );
+    const sig = signRecord(chainHash, null);
+
     // proof_files
     db.prepare(`
       INSERT INTO proof_files (
@@ -482,7 +484,7 @@ async function processFileChange(
     });
   });
 
-  transaction();
+  transaction.immediate();
 }
 
 // ============================================================================
