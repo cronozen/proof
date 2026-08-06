@@ -40,7 +40,7 @@
     "prepublishOnly": "npm run build"
   },
   "dependencies": {
-    "@cronozen/dp-schema-public": "0.1.0"
+    "@cronozen/dp-schema-public": "^0.2.0"
   },
   "devDependencies": {
     "tsup": "^8.0.1",
