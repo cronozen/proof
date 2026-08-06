@@ -204,6 +204,42 @@ are **not** covered by the hash. The API adds an explicit warning to `limitation
 
 ---
 
+## Deployment scope flags
+
+The API ships with three feature groups **off by default**. They are gated, not removed —
+each one is enabled only after its own review.
+
+| Env var | Default | Gates | Enable only after |
+|---|---|---|---|
+| `PROOF_ENABLE_FILES` | `false` | `POST /files/upload`, `GET /files` | Volume capacity and retention policy are settled — uploads land on the machine's local disk |
+| `PROOF_ENABLE_DRIVE` | `false` | `/integrations/google-drive/*`, `POST /webhooks/google-drive` | The webhook has signature verification and OAuth tokens are encrypted at rest (currently stored in plaintext) |
+| `PROOF_ENABLE_QUOTA` | `false` | Quota middleware on `/decision-events` and `/files` | You intend to enforce plan limits — `proof_free` caps at 100 events, so enabling it can start rejecting writes from tenants already above the cap |
+
+Why this exists: the deployed image had drifted behind `main`, so those routes had never actually
+run in production. Shipping the verification engine would have switched all three on at once,
+including an unauthenticated public webhook that no one had reviewed. Gating them keeps the
+deployed surface identical to what was already live, plus the verification endpoints.
+
+## Server signing key
+
+Verification is meaningfully stronger with a server signature: without one, hash recomputation
+does not stop anyone who can write to the database — they can change a record and recompute its
+hash. With one, forging a record requires the signing key.
+
+```bash
+npm run keygen --workspace=api-server   # prints PROOF_SIGNING_PRIVATE_KEY and the public key
+```
+
+⚠️ **Set the key before the first deploy that writes v3 records.** Records written while no key is
+configured carry no signature; once a key is later configured, those records report
+`serverSignature: missing` and fail verification permanently. There is no backfill — a signature
+cannot be added after the fact without re-signing history, which would defeat its purpose.
+
+Distribute the public key (also served at `/verify/public-key`) so third parties can verify
+without trusting this server's response.
+
+---
+
 ## Self-Hosted Deployment
 
 ### Docker

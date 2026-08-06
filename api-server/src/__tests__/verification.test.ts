@@ -847,6 +847,52 @@ describe('마이그레이션 순서', () => {
   });
 });
 
+// ─── 배포 범위 플래그 ───────────────────────────────────────────────
+
+describe('배포 범위 — 미실사 기능은 기본으로 안 켜진다', () => {
+  it('기본값에서 파일·Drive·웹훅 경로가 마운트되지 않는다 (현재 프로덕션과 동일한 표면)', async () => {
+    // 라이브 배포본 실측(2026-08-05): 이 셋은 전부 404 였다.
+    // 검증 엔진을 올리면서 조용히 켜지면 안 된다 — 무인증 웹훅과 평문 OAuth 토큰이 들어 있다.
+    for (const p of ['/files/upload', '/integrations/status', '/webhooks/google-drive']) {
+      const res = await app.fetch(new Request(`http://localhost${p}`));
+      assert.equal(res.status, 404, `${p} 가 기본값에서 열려 있다`);
+    }
+  });
+
+  it('루트 응답이 없는 경로를 광고하지 않는다', async () => {
+    const body = (await (await app.fetch(new Request('http://localhost/'))).json()) as any;
+
+    assert.ok(!('files' in body.endpoints));
+    assert.ok(!('webhooks' in body.endpoints));
+    assert.ok(!('integrations' in body.endpoints));
+    assert.equal(body.endpoints.verify, '/verify/:id');
+    assert.equal(body.endpoints.verifyChain, '/decision-events/verify-chain/:domain');
+  });
+
+  it('플래그를 켜면 마운트된다 (지운 게 아니라 끈 것이다)', async () => {
+    const { createApp } = await import('../app.js');
+    const enabled = createApp({ files: true, drive: true, quota: false });
+
+    // 인증이 붙어 404 가 아닌 응답이 나오면 마운트된 것이다.
+    const files = await enabled.fetch(new Request('http://localhost/files/upload', { method: 'POST' }));
+    assert.notEqual(files.status, 404);
+
+    const status = await enabled.fetch(new Request('http://localhost/integrations/status'));
+    assert.notEqual(status.status, 404);
+  });
+
+  it('쿼타는 기본으로 꺼져 있다 — 켜면 기존 테넌트가 100건에서 막힌다', async () => {
+    // 기본 앱에서 기록이 quota 응답 없이 통과하는지로 확인한다.
+    const { body } = await post('/decision-events', {
+      type: 'ai_decision',
+      actor: { id: 'a', type: 'ai' },
+      action: { type: 'X' },
+      metadata: { domain: 'quota-off' },
+    });
+    assert.ok(!('quota' in body), '쿼타가 기본으로 켜져 있다');
+  });
+});
+
 // ─── 없는 것 ───────────────────────────────────────────────────────
 
 describe('없는 증거', () => {

@@ -9,6 +9,21 @@ primary_region = "nrt"  # Tokyo (서울에서 가장 가까운 Fly 리전)
   PUBLIC_URL = "https://api.cronozen.com"
   NODE_ENV = "production"
 
+  # 🔴 배포 범위 — 미실사 기능은 명시적으로 끈다 (부재에 의존하지 않는다)
+  #
+  # 2026-08-05 실측: 라이브 이미지가 main 보다 오래돼서 `/files`·`/integrations`·`/webhooks`
+  # 가 전부 404 였다. 2026-04-07 커밋(파일 증빙·Drive 연동·쿼타)이 한 번도 배포된 적 없다.
+  # 검증 엔진만 올리기로 했으므로 그 미배포분은 꺼둔다 —
+  # 그 안에는 **무인증 공개 웹훅**과 **평문 OAuth 토큰 저장**이 있고 실사한 적이 없다.
+  #
+  # 각각 자기 실사를 통과한 뒤 "true" 로 바꿔 켠다. 켜기 전에:
+  #   FILES — 256MB 단일 머신의 로컬 디스크에 쓴다. 볼륨 용량·정리 정책 확인.
+  #   DRIVE — 무인증 웹훅 서명 검증, OAuth 토큰 암호화가 선행되어야 한다.
+  #   QUOTA — proof_free 100건 한도. 켜는 순간 한도를 넘긴 테넌트의 기록이 막힌다.
+  PROOF_ENABLE_FILES = "false"
+  PROOF_ENABLE_DRIVE = "false"
+  PROOF_ENABLE_QUOTA = "false"
+
 [http_service]
   internal_port = 3200
   force_https = true

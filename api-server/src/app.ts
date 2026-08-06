@@ -24,7 +24,46 @@ import { getDB } from './db/connection.js';
 import { computeCoverage, verifyRecord, type DecisionEventRow } from './lib/verification.js';
 import { exportPublicKeyPem } from './lib/signing.js';
 
-export const app = new Hono();
+/**
+ * 🔴 배포 범위 플래그 — **기본 꺼짐**
+ *
+ * ## 왜 있나 (2026-08-05)
+ *
+ * 라이브 배포본이 main 보다 오래된 이미지였다. 실측: `/files`·`/integrations/status`·
+ * `/webhooks/google-drive` 가 전부 404 — 2026-04-07 커밋(파일 증빙·Drive 연동·쿼타)이
+ * **한 번도 배포된 적 없다.**
+ *
+ * 검증 엔진을 배포하려면 그 미배포분이 통째로 같이 켜진다. 그 중에는
+ * **무인증 공개 웹훅**과 **평문 OAuth 토큰 저장**이 들어 있고, 그건 이번에 실사한 적이 없다.
+ * 실사하지 않은 것을 실사한 것에 태워 보내면 오늘의 실사가 의미를 잃는다.
+ *
+ * 그래서 지우지 않고 **끈다.** 지우면 main 과 갈라지고 나중에 되살릴 때 또 위험해진다.
+ * 끄면 배포되는 표면이 지금 프로덕션과 동일해진다(검증 엔드포인트만 추가).
+ * 각 기능은 자기 실사를 통과한 뒤 플래그로 따로 켠다.
+ */
+function flagOn(name: string): boolean {
+  return ['1', 'true', 'yes'].includes((process.env[name] || '').trim().toLowerCase());
+}
+
+export interface AppFeatures {
+  /** `/files/*` — 파일 증빙 업로드. 256MB 단일 머신의 로컬 디스크에 쓴다. */
+  files: boolean;
+  /** `/integrations/*` + `/webhooks/*` — Google Drive 연동. 무인증 웹훅 + 평문 OAuth 토큰. */
+  drive: boolean;
+  /** `/decision-events` 의 쿼타 게이트. proof_free 는 100건 한도 — 켜면 기존 테넌트가 막힐 수 있다. */
+  quota: boolean;
+}
+
+export function resolveFeatures(): AppFeatures {
+  return {
+    files: flagOn('PROOF_ENABLE_FILES'),
+    drive: flagOn('PROOF_ENABLE_DRIVE'),
+    quota: flagOn('PROOF_ENABLE_QUOTA'),
+  };
+}
+
+export function createApp(features: AppFeatures = resolveFeatures()) {
+const app = new Hono();
 
 // ─── Global Middleware ─────────────────────────────────────────────
 
@@ -38,15 +77,21 @@ app.get('/', (c) => {
     name: 'Cronozen Proof API',
     version: '0.1.0',
     docs: 'https://github.com/cronozen/proof',
+    // 실제로 마운트된 것만 싣는다. 없는 경로를 광고하면 문서가 거짓말이 된다.
     endpoints: {
       health: '/health',
       decisions: '/decision-events',
       evidence: '/evidence/:id',
-      files: '/files/upload',
-      integrations: '/integrations/google-drive/connect',
-      webhooks: '/webhooks/google-drive',
       verify: '/verify/:id',
       verifyPublicKey: '/verify/public-key',
+      verifyChain: '/decision-events/verify-chain/:domain',
+      ...(features.files ? { files: '/files/upload' } : {}),
+      ...(features.drive
+        ? {
+            integrations: '/integrations/google-drive/connect',
+            webhooks: '/webhooks/google-drive',
+          }
+        : {}),
     },
   });
 });
@@ -60,8 +105,11 @@ app.get('/health', (c) => {
 });
 
 // ─── Webhooks (unauthenticated — external services call directly) ──
-
-app.route('/webhooks', webhooksRouter);
+//
+// 🔴 무인증 공개 엔드포인트다. 실사 전에는 마운트하지 않는다.
+if (features.drive) {
+  app.route('/webhooks', webhooksRouter);
+}
 
 // ─── Public Verification (unauthenticated) ─────────────────────────
 
@@ -201,20 +249,30 @@ app.get('/verify/:id', (c) => {
 // ─── Authenticated Routes ──────────────────────────────────────────
 
 app.use('/decision-events/*', authMiddleware);
-app.use('/decision-events/*', quotaMiddleware());
+if (features.quota) app.use('/decision-events/*', quotaMiddleware());
 app.use('/evidence/*', authMiddleware);
-app.use('/files/*', authMiddleware);
-app.use('/files/*', quotaMiddleware());
-// OAuth callback은 인증 불필요 (Google이 리다이렉트) — 나머지는 인증 필요
-app.use('/integrations/google-drive/connect', authMiddleware);
-app.use('/integrations/google-drive/folders', authMiddleware);
-app.use('/integrations/google-drive/watch', authMiddleware);
-app.use('/integrations/google-drive/disconnect', authMiddleware);
-app.use('/integrations/status', authMiddleware);
+
+if (features.files) {
+  app.use('/files/*', authMiddleware);
+  if (features.quota) app.use('/files/*', quotaMiddleware());
+}
+
+if (features.drive) {
+  // OAuth callback은 인증 불필요 (Google이 리다이렉트) — 나머지는 인증 필요
+  app.use('/integrations/google-drive/connect', authMiddleware);
+  app.use('/integrations/google-drive/folders', authMiddleware);
+  app.use('/integrations/google-drive/watch', authMiddleware);
+  app.use('/integrations/google-drive/disconnect', authMiddleware);
+  app.use('/integrations/status', authMiddleware);
+}
 
 app.route('/decision-events', decisionsRouter);
 app.route('/evidence', evidenceRouter);
-app.route('/files', filesRouter);
-app.route('/integrations', integrationsRouter);
+if (features.files) app.route('/files', filesRouter);
+if (features.drive) app.route('/integrations', integrationsRouter);
 
+  return app;
+}
+
+export const app = createApp();
 export default app;
