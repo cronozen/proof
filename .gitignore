@@ -5,3 +5,7 @@ dist/
 .DS_Store
 *.tsbuildinfo
 api-server/data/
+
+# 세션 증빙 체인 — 이 레포는 **공개**다. DPU 본문에는 내부 결정과 재무 수치가 들어간다.
+# (비공개 레포인 thearound-dataforge 는 커밋하지만 여기선 안 된다.)
+.cronozen/
