@@ -84,6 +84,16 @@ const deps: HarnessDeps = {
     const res = await app.fetch(new Request(`http://localhost/verify/${evidenceId}`));
     return (await res.json()) as any;
   },
+
+  async anchor() {
+    const res = await app.fetch(
+      new Request('http://localhost/decision-events/anchor', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${API_KEY}` },
+      }),
+    );
+    assert.equal(res.status, 201, `anchor failed: ${await res.text()}`);
+  },
 };
 
 // ─── 실행 ──────────────────────────────────────────────────────────

@@ -98,6 +98,49 @@ CREATE INDEX IF NOT EXISTS idx_decision_events_chain ON decision_events(chain_do
 CREATE INDEX IF NOT EXISTS idx_decision_events_idempotency ON decision_events(idempotency_key);
 CREATE INDEX IF NOT EXISTS idx_decision_events_seals ON decision_events(seals_decision_id);
 
+-- 체인 앵커 — 특정 시점의 체인 머리를 박제한다
+--
+-- 🔑 왜 필요한가: DB 안의 어떤 값으로도 "무엇이 있었는지"는 알 수 없다.
+--    꼬리를 지우면 남은 체인은 인덱스가 연속이고 링크도 맞아 정상으로 보인다.
+--    앵커는 "T 시점에 머리가 여기였다"를 밖에 박아, 그 뒤로 짧아진 것을 드러낸다.
+--
+-- 🔴 이 표가 우리 DB 안에 있는 한, DB 를 쓸 수 있는 자는 앵커도 같이 지울 수 있다.
+--    그래서 이 표는 **탐지 절차**를 세우는 자리이고, 앵커 자체를 위조 불가로 만드는 것은
+--    외부 제공자(OTS 등)의 몫이다. provider/receipt 가 그 자리다.
+CREATE TABLE IF NOT EXISTS chain_anchors (
+  id TEXT PRIMARY KEY,
+  tenant_id TEXT NOT NULL,
+
+  tree_version TEXT NOT NULL,        -- 'anchor-v1'
+  merkle_root TEXT NOT NULL,
+  prev_root TEXT,                    -- 직전 앵커의 root. 앵커 기록 자체의 절단을 막는다.
+  leaf_count INTEGER NOT NULL,
+
+  anchored_at TEXT NOT NULL,
+
+  -- 외부 증빙. provider='none' 이면 아직 우리 DB 안에만 있는 것이다 — 그렇게 보고한다.
+  provider TEXT NOT NULL DEFAULT 'none',
+  receipt TEXT,
+  confirmed_at TEXT,
+
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_chain_anchors_tenant ON chain_anchors(tenant_id, anchored_at);
+
+-- 앵커가 덮은 각 체인의 머리
+CREATE TABLE IF NOT EXISTS chain_anchor_heads (
+  anchor_id TEXT NOT NULL,
+  tenant_id TEXT NOT NULL,
+  chain_domain TEXT NOT NULL,
+  chain_index INTEGER NOT NULL,
+  chain_hash TEXT NOT NULL,
+  PRIMARY KEY (anchor_id, chain_domain)
+);
+
+CREATE INDEX IF NOT EXISTS idx_chain_anchor_heads_lookup
+  ON chain_anchor_heads(tenant_id, chain_domain, chain_index);
+
 -- 파일 증빙 (업로드형 하네스)
 CREATE TABLE IF NOT EXISTS proof_files (
   id TEXT PRIMARY KEY,

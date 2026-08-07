@@ -17,6 +17,7 @@ import {
 } from '../lib/chain-content.js';
 import { signRecord } from '../lib/signing.js';
 import { verifyChain } from '../lib/verification.js';
+import { createAnchor } from '../lib/anchor.js';
 import type { AuthContext } from '../middleware/auth.js';
 import type { QuotaInfo } from '../middleware/quota.js';
 
@@ -227,6 +228,22 @@ decisionsRouter.get('/', async (c) => {
     data: rows.map(formatEvent),
     pagination: { total, limit, offset, hasMore: offset + limit < total },
   });
+});
+
+// ─── POST /decision-events/anchor ──────────────────────────────────
+
+/**
+ * 지금 시점의 모든 체인 머리를 하나의 Merkle root 로 묶어 박제한다.
+ *
+ * ⚠️ `/:id` 라우트보다 **먼저** 선언해야 한다.
+ * 🔴 이 앵커는 아직 우리 DB 안에만 있다(provider='none'). 외부 제공자(OTS)에 root 를
+ *    제출하는 것이 남았고, 그 전까지는 DB 를 쓸 수 있는 자가 앵커도 함께 지울 수 있다.
+ *    검증 응답이 `externallyAttested: false` 로 그 사실을 말한다.
+ */
+decisionsRouter.post('/anchor', async (c) => {
+  const auth = c.get('auth');
+  const result = createAnchor(getDB(), auth.tenantId);
+  return c.json({ data: result }, 201);
 });
 
 // ─── GET /decision-events/verify-chain/:domain ─────────────────────

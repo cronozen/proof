@@ -46,6 +46,7 @@ import {
   type ChainColumns,
 } from './chain-content.js';
 import { verifyRecordSignature, type SignatureCheck } from './signing.js';
+import { checkAnchor, type AnchorCheck } from './anchor.js';
 
 /** Coverage 계산 시 한 번에 훑을 최대 레코드 수. 넘으면 truncated를 응답에 표시한다(조용히 자르지 않는다). */
 export const COVERAGE_SCAN_LIMIT = 1000;
@@ -107,6 +108,11 @@ export interface VerificationResult {
     chainLink: Check;
     seal: Check & { binding: SealBinding };
     serverSignature: SignatureCheck;
+    /**
+     * 외부 앵커와의 대조 — 꼬리 절단이 드러나는 유일한 자리.
+     * `externallyAttested: false` 면 앵커가 아직 우리 DB 안에만 있다는 뜻이다.
+     */
+    anchor: AnchorCheck;
     trustedTimestamp: { status: 'not_implemented'; detail: string };
   };
   chainPayloadVersion: number;
@@ -443,6 +449,7 @@ export function verifyRecord(db: Database, row: DecisionEventRow): VerificationR
 
   // 봉인·서명은 호출자마다 모델이 달라 엔진에 올리지 않았다(ops 에는 seal_hash 개념이 없다).
   const seal = checkSeal(db, row);
+  const anchor = checkAnchor(db, row.tenant_id, row.chain_domain);
   const serverSignature = verifyRecordSignature({
     chainHash: row.chain_hash ?? '',
     sealHash: row.seal_hash,
@@ -456,6 +463,7 @@ export function verifyRecord(db: Database, row: DecisionEventRow): VerificationR
   // 갈린 문구는 "같은 결함인데 검증기마다 다르게 말하는" 상태가 된다.
   const failures: string[] = [...core.failures];
   if (!seal.ok) failures.push(`seal: ${seal.detail}`);
+  if (!anchor.ok) failures.push(`anchor: ${anchor.detail}`);
 
   // 🔴 다운그레이드 봉쇄 — 이 조직에서 가장 비싼 종류의 결함이었다.
   //
@@ -526,6 +534,7 @@ export function verifyRecord(db: Database, row: DecisionEventRow): VerificationR
       chainLink,
       seal,
       serverSignature,
+      anchor,
       trustedTimestamp: {
         status: 'not_implemented',
         detail:

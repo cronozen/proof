@@ -194,6 +194,8 @@ app.get('/verify/:id', (c) => {
       sealedAt: row.sealed_at || null,
       // 승인이 무엇에 결속돼 있는가 — 'chain' 이어야 외부 앵커가 승인까지 덮는다.
       sealBinding: result.checks.seal.binding,
+      anchoredAt: result.checks.anchor.anchoredAt ?? null,
+      anchorStatus: result.checks.anchor.status,
     },
 
     coverage: coverage
@@ -209,7 +211,9 @@ app.get('/verify/:id', (c) => {
 
     limitations: [
       'This endpoint proves that the record we hold is internally consistent with the hashes we hold.',
-      'It is not third-party attestation: there is no RFC 3161 trusted timestamp and no external anchor yet.',
+      // 🪤 이 줄이 "앵커 없음" 으로 굳어 있으면 앵커가 생긴 뒤에도 거짓말이 된다.
+      //    앵커 상태에 따라 달라져야 한다 — 아래 앵커 항목이 실제 강도를 말한다.
+      'It is not third-party attestation: there is no RFC 3161 trusted timestamp.',
       // 🔴 서명이 없으면 해시 재계산은 **DB 를 쓸 수 있는 사람** 앞에서 무력하다.
       //    그 사람은 내용을 바꾸고 해시도 다시 계산하면 그만이다.
       //    "unaltered since recording" 이라고 단언하면 그 사실을 덮는다.
@@ -245,10 +249,27 @@ app.get('/verify/:id', (c) => {
       //    인덱스가 연속이고 링크도 맞아 "정상"으로 보인다. 안에서는 풀 수 없는 문제 —
       //    체인의 머리를 밖에 박아두는 외부 앵커가 있어야 한다.
       //    이걸 안 적으면 "verified"가 "아무것도 삭제되지 않았다"로 읽힌다.
-      'Truncation is not detectable: if the most recent records were deleted, the remaining chain still ' +
-        'verifies. This includes a seal record, which is appended at the tail — deleting it silently downgrades ' +
-        'sealBinding from "chain" to "row". Detecting a missing tail requires an external anchor, which is not ' +
-        'implemented yet.',
+      // 🎉 2026-08-07: 앵커가 생겨 꼬리 절단이 탐지된다. 다만 앵커가 **어디에 있느냐**가
+      //    보증의 강도를 가른다 — 우리 DB 안에만 있으면 같이 지워질 수 있다.
+      ...(result.checks.anchor.status === 'no_anchor'
+        ? [
+            'WARNING: no anchor covers this chain yet. Deleting the most recent records (including a seal '
+              + 'record) would leave a chain that still verifies — truncation is undetectable until an anchor exists.',
+          ]
+        : result.checks.anchor.externallyAttested
+          ? [
+              `The chain head was anchored at ${result.checks.anchor.anchoredAt} and attested externally `
+                + `(${result.checks.anchor.provider}), so truncation below that point is detectable by a third party.`,
+            ]
+          : [
+              `The chain head was anchored at ${result.checks.anchor.anchoredAt}, which makes truncation below `
+                + 'that point detectable. But this anchor is stored in the same database as the records and has NOT '
+                + 'been submitted to an external provider — someone who can write to the database could erase both. '
+                + 'Treat it as an internal consistency control, not as third-party evidence.',
+            ]),
+      ...(result.checks.anchor.status === 'unanchored_growth'
+        ? ['Records added after the last anchor are not yet covered — deleting only those is still undetectable.']
+        : []),
       // 🔴 v2 레코드의 "verified: true" 는 실제보다 훨씬 강하게 읽힌다.
       //    해시가 3개 필드만 덮으므로 산출물·AI 근거·승인 결과는 결속되어 있지 않다.
       //    이 사실을 조용히 두면 검증이 없는 것보다 나쁘다.

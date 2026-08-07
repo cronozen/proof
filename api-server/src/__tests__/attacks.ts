@@ -237,21 +237,16 @@ export const ATTACKS: Attack[] = [
   {
     id: 'seal-record-delete',
     what: '체인에서 봉인 레코드 자체를 지운다',
-    impact: '승인 흔적을 체인째 없애려는 시도 — 체인에 구멍이 생긴다',
-    setup: 'sealed',
+    impact: '승인 흔적을 체인째 없애려는 시도 — 봉인 레코드는 꼬리라 링크로는 안 잡힌다',
     mutate: ctx => {
       const target = row(ctx);
       ctx.db.prepare("DELETE FROM decision_events WHERE type = 'seal' AND seals_decision_id = ?")
         .run(target.decision_id);
     },
-    detectedBy: 'seal',
-    knownGap: {
-      why:
-        '봉인 레코드는 체인의 **꼬리**다(승인 시 맨 끝에 붙는다). 꼬리를 지우면 남은 체인은 '
-        + '인덱스가 연속이고 링크도 맞아 정상으로 보인다 — 꼬리 절단의 다른 얼굴이다. '
-        + '다만 응답의 seal.binding 이 chain → row 로 **눈에 띄게 약해진다**',
-      needs: '외부 앵커 (앵커된 헤드가 현재 헤드의 조상인지 대조)',
-    },
+    // 🎉 앵커가 생기면서 잡힌다 — 봉인 레코드가 꼬리이므로 지우면 체인이 앵커보다 짧아진다.
+    setup: 'anchoredSeal',
+    detectedBy: 'anchor',
+    detailMatches: /deleted from the tail|missing from the chain/i,
   },
   {
     id: 'seal-record-retarget',
@@ -264,19 +259,51 @@ export const ATTACKS: Attack[] = [
     },
     detectedBy: 'seal',
   },
+  // ── 꼬리 절단 (2026-08-07 앵커로 막힘) ──────────────────────────
   {
-    id: 'gap-tail-truncation',
+    id: 'tail-truncation',
     what: '체인의 마지막 레코드들을 지운다',
     impact: '가장 최근 기록이 사라져도 남은 체인은 인덱스가 연속이고 링크도 맞아 정상으로 보인다',
-    setup: 'chain3',
+    // 🎉 앵커를 찍은 뒤 꼬리를 지우면, 앵커가 "그때 머리는 #2 였다"고 말하는데
+    //    지금 머리가 #1 이라 드러난다. 남은 체인의 정합성으로는 못 숨긴다.
+    setup: 'anchored',
     mutate: ctx => {
-      // 대상(가운데) 뒤를 전부 지운다 → 대상이 새 꼬리가 된다
       ctx.db.prepare('DELETE FROM decision_events WHERE evidence_id = ?').run(ctx.records[2].evidenceId);
     },
-    detectedBy: 'chainLink',
+    detectedBy: 'anchor',
+    detailMatches: /deleted from the tail|missing from the chain/i,
+  },
+  {
+    id: 'anchor-rewrite-below',
+    what: '앵커된 위치의 레코드를 다른 것으로 바꿔치기한다',
+    impact: '앵커 아래를 다시 써서 과거를 바꾸려는 시도',
+    setup: 'anchored',
+    mutate: ctx => {
+      // 앵커된 머리(#2)의 해시를 바꾼다
+      ctx.db.prepare('UPDATE decision_events SET chain_hash = ? WHERE evidence_id = ?')
+        .run('c'.repeat(64), ctx.records[2].evidenceId);
+    },
+    detectedBy: 'anchor',
+    detailMatches: /rewritten below the anchor/i,
+  },
+
+  // ── 🔴 아직 못 막는 것 ─────────────────────────────────────────
+  {
+    id: 'gap-truncate-with-anchor-erasure',
+    what: '꼬리를 지우면서 앵커 기록까지 함께 지운다',
+    impact:
+      '앵커가 우리 DB 안에 있는 한, DB 를 쓸 수 있는 자는 앵커도 같이 지운다. '
+      + '그러면 "앵커가 없는 체인" 이 되어 대조할 것이 사라진다',
+    setup: 'anchored',
+    mutate: ctx => {
+      ctx.db.prepare('DELETE FROM decision_events WHERE evidence_id = ?').run(ctx.records[2].evidenceId);
+      ctx.db.prepare('DELETE FROM chain_anchor_heads WHERE chain_domain = ?').run(ctx.domain);
+      ctx.db.prepare('DELETE FROM chain_anchors').run();
+    },
+    detectedBy: 'anchor',
     knownGap: {
-      why: '남은 체인만 보면 완전하다 — 무엇이 있었는지 알 방법이 DB 안에 없다',
-      needs: '외부 앵커 (앵커된 헤드가 현재 헤드의 조상인지 대조)',
+      why: '앵커 표가 같은 DB 안에 있어서 함께 지워진다 — 탐지 절차는 섰지만 앵커 자체가 위조 가능하다',
+      needs: '외부 제공자 제출 (OpenTimestamps 등) — root 가 우리 손 밖에 있어야 한다',
     },
   },
 ];

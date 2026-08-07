@@ -32,12 +32,13 @@ export interface VerifyResponse {
     chainLink: { ok: boolean; detail?: string };
     seal: { ok: boolean; detail?: string };
     serverSignature: { status: string; detail?: string };
+    anchor: { ok: boolean; status: string; detail?: string; externallyAttested?: boolean };
   };
   failures: string[];
   evidence: Record<string, unknown>;
 }
 
-export type CheckName = 'chainHash' | 'contentCoverage' | 'chainLink' | 'seal' | 'serverSignature';
+export type CheckName = 'chainHash' | 'contentCoverage' | 'chainLink' | 'seal' | 'serverSignature' | 'anchor';
 
 export interface AttackContext {
   db: Database;
@@ -62,8 +63,10 @@ export interface Attack {
    *   'sealed'  — 승인(approved)까지 끝난 레코드 1건
    *   'rejected'— 반려(rejected)된 레코드 1건
    *   'chain3'  — 같은 도메인에 3건 (target = 가운데)
+   *   'anchored'— 3건 기록 후 **앵커를 찍는다** (target = 가운데)
+   *   'anchoredSeal' — 기록+승인 후 앵커 (target = 결정 레코드)
    */
-  setup: 'record' | 'sealed' | 'rejected' | 'chain3';
+  setup: 'record' | 'sealed' | 'rejected' | 'chain3' | 'anchored' | 'anchoredSeal';
   /** DB 를 직접 조작한다 — 공격자가 쓰기 권한을 얻은 상황 그대로. */
   mutate(ctx: AttackContext): void;
   /** 이 검사가 실패해야 한다. 다른 검사가 대신 잡으면 그건 우연이므로 실패로 본다. */
@@ -96,19 +99,26 @@ export interface HarnessDeps {
   approve(decisionId: string, result: 'approved' | 'rejected'): Promise<void>;
   /** 공개 검증을 부른다. */
   verify(evidenceId: string): Promise<VerifyResponse>;
+  /** 지금 시점의 체인 머리를 앵커한다. */
+  anchor(): Promise<void>;
 }
 
 async function buildSetup(deps: HarnessDeps, attack: Attack, domain: string): Promise<AttackContext> {
   const records: { evidenceId: string; decisionId: string }[] = [];
 
-  const count = attack.setup === 'chain3' ? 3 : 1;
+  const many = attack.setup === 'chain3' || attack.setup === 'anchored';
+  const count = many ? 3 : 1;
   for (let i = 0; i < count; i += 1) records.push(await deps.record(domain));
 
   if (attack.setup === 'sealed') await deps.approve(records[0].decisionId, 'approved');
   if (attack.setup === 'rejected') await deps.approve(records[0].decisionId, 'rejected');
+  if (attack.setup === 'anchoredSeal') await deps.approve(records[0].decisionId, 'approved');
 
-  // chain3 은 가운데를 노린다 — 앞뒤 링크가 둘 다 있는 유일한 위치다.
-  const target = attack.setup === 'chain3' ? records[1] : records[0];
+  // 앵커는 **마지막에** 찍는다 — 지금 머리를 박제하는 것이므로.
+  if (attack.setup === 'anchored' || attack.setup === 'anchoredSeal') await deps.anchor();
+
+  // chain3/anchored 는 가운데를 노린다 — 앞뒤 링크가 둘 다 있는 유일한 위치다.
+  const target = many ? records[1] : records[0];
   return { db: deps.db, domain, records, target };
 }
 
@@ -120,6 +130,7 @@ function firstFailingCheck(res: VerifyResponse): CheckName | null {
   if (res.checks.serverSignature.status === 'invalid' || res.checks.serverSignature.status === 'missing') {
     return 'serverSignature';
   }
+  if (!res.checks.anchor.ok) return 'anchor';
   return null;
 }
 
