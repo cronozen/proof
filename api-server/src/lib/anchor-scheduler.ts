@@ -29,6 +29,7 @@
 
 import type { Database } from 'better-sqlite3';
 import { createAnchor, submitAnchor } from './anchor.js';
+import { upgradeOts } from './anchor-providers.js';
 
 /** 앵커 간격. 이 값이 곧 "탐지 못 하는 창" 의 상한이다. */
 export function anchorIntervalMs(): number {
@@ -184,6 +185,47 @@ export async function runAnchorTick(db: Database): Promise<{ tenantId: string; r
   return done;
 }
 
+/**
+ * 아직 'submitted' 인 OTS 영수증들을 업그레이드해 본다.
+ *
+ * 🔴 이게 없으면 OTS 는 **영원히 submitted** 다 — 캘린더 약속만 들고 "앵커 있음" 이라 말하게 된다.
+ * 404(아직 확정 안 됨)는 정상이고 흔하다. 비트코인 확정에 보통 수 시간 걸린다.
+ */
+export async function runOtsUpgradeTick(db: Database): Promise<{ upgraded: number; pending: number }> {
+  const rows = db
+    .prepare("SELECT anchor_id, receipt FROM anchor_submissions WHERE provider = 'ots' AND status = 'submitted'")
+    .all() as { anchor_id: string; receipt: string | null }[];
+
+  let upgraded = 0, pending = 0;
+  const now = new Date().toISOString();
+
+  for (const row of rows) {
+    if (!row.receipt) continue;
+    const result = await upgradeOts(row.receipt);
+
+    if (result.status === 'confirmed') {
+      db.prepare(`
+        UPDATE anchor_submissions
+        SET status = 'confirmed', receipt = ?, external_ref = ?, confirmed_at = ?, error = NULL,
+            attempts = attempts + 1, last_attempt_at = ?
+        WHERE anchor_id = ? AND provider = 'ots'
+      `).run(result.receipt, result.externalRef, now, now, row.anchor_id);
+      db.prepare("UPDATE chain_anchors SET confirmed_at = COALESCE(confirmed_at, ?) WHERE id = ?").run(now, row.anchor_id);
+      upgraded += 1;
+      console.log(`[anchor] ots upgraded anchor=${row.anchor_id} (${result.externalRef})`);
+    } else {
+      // 아직이면 시도만 기록한다. 상태를 바꾸지 않는다 — 없는 확정을 만들지 않는다.
+      db.prepare(`
+        UPDATE anchor_submissions SET attempts = attempts + 1, last_attempt_at = ?, error = ?
+        WHERE anchor_id = ? AND provider = 'ots'
+      `).run(now, result.detail, row.anchor_id);
+      pending += 1;
+    }
+  }
+
+  return { upgraded, pending };
+}
+
 let timer: ReturnType<typeof setInterval> | null = null;
 
 /**
@@ -197,6 +239,11 @@ export function startAnchorScheduler(db: Database): void {
     runAnchorTick(db).then(done => {
       for (const d of done) console.log(`[anchor] anchored tenant=${d.tenantId} (${d.reason})`);
     }).catch(err => console.error(`[anchor] tick failed: ${(err as Error).message}`));
+
+    // 업그레이드는 앵커 생성과 **다른 주기**로 돌 이유가 없다. 같은 틱에 얹는다.
+    runOtsUpgradeTick(db)
+      .then(r => { if (r.upgraded > 0) console.log(`[anchor] ots upgraded ${r.upgraded}, still pending ${r.pending}`); })
+      .catch(err => console.error(`[anchor] ots upgrade failed: ${(err as Error).message}`));
   }, every);
 
   // 프로세스를 붙잡지 않는다 — 종료가 이것 때문에 막히면 안 된다.

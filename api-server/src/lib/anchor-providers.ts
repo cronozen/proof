@@ -259,6 +259,129 @@ export async function submitToRekor(statement: string, fetchImpl = fetch): Promi
   }
 }
 
+
+// ─── OTS 바이너리 파싱 (업그레이드에 필요한 만큼만) ──────────────────
+//
+// 🔑 **필요한 만큼만** 판다. 전체 포맷을 다 구현하면 틀릴 자리가 늘어나고,
+//    우리에게 필요한 건 둘뿐이다:
+//      ① pending attestation 의 commitment (업그레이드 GET 주소를 만들려고)
+//      ② 업그레이드 응답에 비트코인 증명이 들어왔는가
+//    ②는 매직 바이트 검색으로 충분하다 — 파싱이 틀려도 거짓 확정이 안 난다.
+//
+// 실패는 **안전한 쪽**으로 떨어진다: 못 읽으면 업그레이드를 못 할 뿐,
+// 없는 확정을 있다고 말하지 않는다.
+
+const OP_APPEND = 0xf0, OP_PREPEND = 0xf1, OP_SHA256 = 0x08, OP_ATTESTATION = 0x00, OP_FORK = 0xff;
+const MAGIC_PENDING = '83dfe30d2ef90c8e';
+const MAGIC_BITCOIN = '0588960d73d71901';
+
+function readVaruint(buf: Buffer, pos: number): [number, number] {
+  let value = 0, shift = 0, b: number;
+  do { b = buf[pos++]; value |= (b & 0x7f) << shift; shift += 7; } while (b & 0x80);
+  return [value, pos];
+}
+
+function readVarbytes(buf: Buffer, pos: number): [Buffer, number] {
+  const [len, p] = readVaruint(buf, pos);
+  return [buf.subarray(p, p + len), p + len];
+}
+
+export interface OtsPending { calendarUri: string; commitment: string }
+
+/** pending attestation 을 찾아 그 지점의 commitment 를 돌려준다. */
+export function parseOtsPending(timestamp: Buffer, digest: Buffer): OtsPending[] {
+  const out: OtsPending[] = [];
+
+  const walk = (pos: number, current: Buffer): void => {
+    while (pos < timestamp.length) {
+      const op = timestamp[pos++];
+
+      if (op === OP_ATTESTATION) {
+        const magic = timestamp.subarray(pos, pos + 8).toString('hex'); pos += 8;
+        const [payload] = readVarbytes(timestamp, pos);
+        if (magic === MAGIC_PENDING) {
+          const [uri] = readVarbytes(payload, 0);
+          out.push({ calendarUri: uri.toString('utf8'), commitment: Buffer.from(current).toString('hex') });
+        }
+        return;
+      }
+      if (op === OP_FORK) { walk(pos, Buffer.from(current)); continue; }
+      if (op === OP_APPEND) { const [b, p] = readVarbytes(timestamp, pos); pos = p; current = Buffer.concat([current, b]); continue; }
+      if (op === OP_PREPEND) { const [b, p] = readVarbytes(timestamp, pos); pos = p; current = Buffer.concat([b, current]); continue; }
+      if (op === OP_SHA256) { current = createHash('sha256').update(current).digest(); continue; }
+
+      return; // 모르는 op — 추측으로 진행하지 않는다
+    }
+  };
+
+  walk(0, Buffer.from(digest));
+  return out;
+}
+
+/** 업그레이드된 timestamp 에 비트코인 증명이 들어왔는가. 매직 검색이라 파싱 실패에 강하다. */
+export function hasBitcoinAttestation(timestamp: Buffer): boolean {
+  return timestamp.toString('hex').includes(MAGIC_BITCOIN);
+}
+
+export interface UpgradeResult {
+  status: SubmissionStatus;
+  receipt: string | null;
+  externalRef: string | null;
+  detail: string;
+}
+
+/**
+ * OTS 영수증을 업그레이드한다 — 캘린더에 다시 물어 비트코인 증명을 채운다.
+ *
+ * 🔴 이게 없으면 OTS 는 **영원히 'submitted'** 다. 캘린더 영수증은 약속일 뿐이고
+ *    비트코인 증명이 들어와야 "우리도 캘린더도 못 바꾸는" 상태가 된다.
+ *
+ * 404 는 실패가 아니라 **아직 확정 안 됨**이다. 보통 수 시간 걸린다.
+ */
+export async function upgradeOts(receiptJson: string, fetchImpl = fetch): Promise<UpgradeResult> {
+  let parsed: { digest: string; calendars: { calendar: string; receipt: string }[] };
+  try {
+    parsed = JSON.parse(receiptJson);
+  } catch {
+    return { status: 'submitted', receipt: null, externalRef: null, detail: 'receipt is not readable' };
+  }
+
+  const digest = Buffer.from(parsed.digest, 'hex');
+  const notes: string[] = [];
+
+  for (const c of parsed.calendars ?? []) {
+    const pendings = parseOtsPending(Buffer.from(c.receipt, 'base64'), digest);
+    for (const p of pendings) {
+      const url = `${p.calendarUri.replace(/\/+$/, '')}/timestamp/${p.commitment}`;
+      try {
+        const res = await fetchImpl(url, { signal: AbortSignal.timeout(15_000) });
+        if (res.status === 404) { notes.push(`${p.calendarUri}: pending`); continue; }
+        if (!res.ok) { notes.push(`${p.calendarUri}: HTTP ${res.status}`); continue; }
+
+        const buf = Buffer.from(await res.arrayBuffer());
+        if (hasBitcoinAttestation(buf)) {
+          return {
+            status: 'confirmed',
+            receipt: JSON.stringify({ digest: parsed.digest, upgraded: buf.toString('base64'), calendar: p.calendarUri }),
+            externalRef: `bitcoin via ${new URL(p.calendarUri).hostname}`,
+            detail: 'Bitcoin attestation present',
+          };
+        }
+        notes.push(`${p.calendarUri}: upgraded but no bitcoin attestation yet`);
+      } catch (err) {
+        notes.push(`${p.calendarUri}: ${(err as Error).message}`);
+      }
+    }
+  }
+
+  return {
+    status: 'submitted',
+    receipt: null,
+    externalRef: null,
+    detail: notes.join(' | ') || 'no pending attestation found in receipt',
+  };
+}
+
 /** 앵커 제출 키 생성 — scripts/generate-anchor-key.ts 에서 사용. */
 export function generateAnchorKeyPair(): { privateKeyPem: string; publicKeyPem: string } {
   const { privateKey, publicKey } = generateKeyPairSync('ec', { namedCurve: 'P-256' });
