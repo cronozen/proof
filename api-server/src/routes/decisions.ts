@@ -344,40 +344,171 @@ decisionsRouter.post('/:id/approvals', async (c) => {
   // 서명은 chain_hash와 seal_hash를 함께 묶는다 → 승인 내용이 바뀌면 서명도 깨진다.
   const sig = signRecord(sealFields.chain_hash, sealHash);
 
-  db.prepare(`
+  /**
+   * 🔑 봉인을 **체인 레코드로 승격**한다 (2026-08-06).
+   *
+   * 왜: `seal_hash` 는 결정 행에 옆으로 매달린 값이라 **어떤 체인에도 들어가지 않았다.**
+   * 다음 레코드의 previous_hash 는 앞 레코드의 chain_hash 를 가리키지 seal_hash 를 가리키지 않는다.
+   * 그래서 체인 헤드를 외부에 앵커해도 "누가 승인했나"는 한 바이트도 안 덮였다 —
+   * ops 가 naive 앵커를 금지한 이유 1번이 모양만 바꿔 그대로 재현되는 상태였다.
+   *
+   * 승인 시 같은 도메인 체인에 `type='seal'` 레코드를 append 하면:
+   *   - 헤드 앵커가 승인까지 **전이적으로** 덮는다
+   *   - 봉인 레코드를 지우면 체인에 구멍이 생겨 링크 검사가 잡는다
+   *   - 결정 행의 승인 필드를 되돌려도 봉인 레코드가 남아 불일치로 잡힌다(롤백 탐지)
+   *
+   * ops 는 이 문제를 별도 테이블(dpu_commitment_events)로 풀었는데, 여기서는 기존 체인
+   * 하나로 푼다 — 같은 것을 두 번 표현하지 않는다.
+   *
+   * 🔴 봉인 레코드의 권위는 **해시된 action_output** 이다. `seals_decision_id` 컬럼은
+   *    조회용 인덱스일 뿐이라 고쳐도 해시가 안 맞아 봉인 레코드 자체가 깨진다.
+   */
+  const sealRecordId = crypto.randomUUID();
+  const sealDecisionId = `dec_${crypto.randomUUID().replace(/-/g, '').slice(0, 16)}`;
+  const sealEvidenceId = `evi_${crypto.randomUUID().replace(/-/g, '').slice(0, 16)}`;
+
+  const sealCols = {
+    id: sealRecordId,
+    decision_id: sealDecisionId,
+    type: 'seal',
+    source_type: 'system',
+    status: 'recorded',
+
+    actor_id: sealFields.approver_id,
+    actor_type: sealFields.approver_type,
+    actor_name: sealFields.approver_name,
+    actor_metadata: null,
+
+    action_type: 'SEAL',
+    action_description: `Seal for ${row.decision_id}`,
+    action_input: null,
+    // 이 JSON 이 봉인의 정본이다. v3 콘텐츠가 이 문자열을 통째로 해시한다.
+    action_output: JSON.stringify({
+      targetDecisionId: row.decision_id,
+      targetEvidenceId: row.evidence_id,
+      targetChainHash: row.chain_hash,
+      result: sealFields.approval_result,
+      evidenceLevel: sealFields.evidence_level,
+      status: sealFields.status,
+      approverId: sealFields.approver_id,
+      approverType: sealFields.approver_type,
+      approverName: sealFields.approver_name,
+      approvedAt: sealFields.approved_at,
+      sealedAt: sealFields.sealed_at,
+      sealHash,
+    }),
+    action_metadata: null,
+
+    ai_model: null,
+    ai_provider: null,
+    ai_confidence: null,
+    ai_prompt_hash: null,
+    ai_reasoning: null,
+    ai_tokens_input: null,
+    ai_tokens_output: null,
+    ai_metadata: null,
+
+    evidence_id: sealEvidenceId,
+    evidence_level: sealFields.evidence_level,
+    chain_index: -1,                      // 트랜잭션 안에서 확정
+    previous_hash: null as string | null, // 〃
+    chain_domain: row.chain_domain,
+
+    occurred_at: sealFields.approved_at,
+    tags: JSON.stringify(['seal']),
+    metadata: JSON.stringify({ domain: row.chain_domain, sealOf: row.decision_id }),
+
+    tenant_id: auth.tenantId,
+    api_key_id: auth.apiKeyId,
+    created_at: now,
+    updated_at: now,
+  };
+
+  const insertSeal = db.prepare(`
+    INSERT INTO decision_events (
+      id, decision_id, type, source_type, status,
+      actor_id, actor_type, actor_name, actor_metadata,
+      action_type, action_description, action_input, action_output, action_metadata,
+      ai_model, ai_provider, ai_confidence, ai_prompt_hash, ai_reasoning,
+      ai_tokens_input, ai_tokens_output, ai_metadata,
+      evidence_id, evidence_level, chain_hash, chain_index, previous_hash, chain_domain,
+      chain_payload_version, signature, signature_alg, signature_key_id, seals_decision_id,
+      occurred_at, tags, metadata,
+      tenant_id, api_key_id, created_at, updated_at
+    ) VALUES (
+      @id, @decision_id, @type, @source_type, @status,
+      @actor_id, @actor_type, @actor_name, @actor_metadata,
+      @action_type, @action_description, @action_input, @action_output, @action_metadata,
+      @ai_model, @ai_provider, @ai_confidence, @ai_prompt_hash, @ai_reasoning,
+      @ai_tokens_input, @ai_tokens_output, @ai_metadata,
+      @evidence_id, @evidence_level, @chain_hash, @chain_index, @previous_hash, @chain_domain,
+      @chain_payload_version, @signature, @signature_alg, @signature_key_id, @seals_decision_id,
+      @occurred_at, @tags, @metadata,
+      @tenant_id, @api_key_id, @created_at, @updated_at
+    )
+  `);
+
+  const updateDecision = db.prepare(`
     UPDATE decision_events SET
-      status = @status,
-      evidence_level = @evidence_level,
-      approver_id = @approver_id,
-      approver_type = @approver_type,
-      approver_name = @approver_name,
-      approval_result = @approval_result,
-      approval_reason = @approval_reason,
-      approved_at = @approved_at,
-      sealed_at = @sealed_at,
-      seal_hash = @seal_hash,
-      signature = @signature,
-      signature_alg = @signature_alg,
-      signature_key_id = @signature_key_id,
+      status = @status, evidence_level = @evidence_level,
+      approver_id = @approver_id, approver_type = @approver_type, approver_name = @approver_name,
+      approval_result = @approval_result, approval_reason = @approval_reason,
+      approved_at = @approved_at, sealed_at = @sealed_at, seal_hash = @seal_hash,
+      signature = @signature, signature_alg = @signature_alg, signature_key_id = @signature_key_id,
       updated_at = @updated_at
     WHERE id = @id
-  `).run({
-    status: sealFields.status,
-    evidence_level: sealFields.evidence_level,
-    approver_id: sealFields.approver_id,
-    approver_type: sealFields.approver_type,
-    approver_name: sealFields.approver_name,
-    approval_result: sealFields.approval_result,
-    approval_reason: sealFields.approval_reason,
-    approved_at: sealFields.approved_at,
-    sealed_at: sealFields.sealed_at,
-    seal_hash: sealHash,
-    signature: sig?.signature ?? null,
-    signature_alg: sig?.alg ?? null,
-    signature_key_id: sig?.keyId ?? null,
-    updated_at: now,
-    id: row.id,
+  `);
+
+  // 결정 행 갱신과 봉인 레코드 append 는 **한 트랜잭션**이어야 한다.
+  // 갈라지면 "승인됐다는 행은 있는데 봉인 레코드가 없는" 상태가 생기고, 그건 검증기가
+  // 위조로 판정하는 모양이다 — 우리 배선이 만든 위조 신호는 최악이다.
+  const sealTx = db.transaction(() => {
+    updateDecision.run({
+      status: sealFields.status,
+      evidence_level: sealFields.evidence_level,
+      approver_id: sealFields.approver_id,
+      approver_type: sealFields.approver_type,
+      approver_name: sealFields.approver_name,
+      approval_result: sealFields.approval_result,
+      approval_reason: sealFields.approval_reason,
+      approved_at: sealFields.approved_at,
+      sealed_at: sealFields.sealed_at,
+      seal_hash: sealHash,
+      signature: sig?.signature ?? null,
+      signature_alg: sig?.alg ?? null,
+      signature_key_id: sig?.keyId ?? null,
+      updated_at: now,
+      id: row.id,
+    });
+
+    const lastInChain = db
+      .prepare(
+        'SELECT chain_hash, chain_index FROM decision_events WHERE chain_domain = ? AND tenant_id = ? ORDER BY chain_index DESC LIMIT 1',
+      )
+      .get(row.chain_domain, auth.tenantId) as { chain_hash: string; chain_index: number } | undefined;
+
+    sealCols.previous_hash = lastInChain?.chain_hash || null;
+    sealCols.chain_index = (lastInChain?.chain_index ?? -1) + 1;
+
+    const sealChainHash = computeChainHash(
+      buildChainContentV3(sealCols),
+      sealCols.previous_hash,
+      sealCols.occurred_at,
+    );
+    const sealSig = signRecord(sealChainHash, null);
+
+    insertSeal.run({
+      ...sealCols,
+      chain_hash: sealChainHash,
+      chain_payload_version: CHAIN_PAYLOAD_VERSION,
+      signature: sealSig?.signature ?? null,
+      signature_alg: sealSig?.alg ?? null,
+      signature_key_id: sealSig?.keyId ?? null,
+      seals_decision_id: row.decision_id,
+    });
   });
+
+  sealTx.immediate();
 
   const updated = db.prepare('SELECT * FROM decision_events WHERE id = ?').get(row.id) as EventRow;
 
@@ -389,7 +520,9 @@ decisionsRouter.post('/:id/approvals', async (c) => {
       result: approvalResult,
       reason: reason || undefined,
       evidenceLevel,
-      sealedHash: approvalResult === 'approved' ? updated.chain_hash : undefined,
+      // 🪤 이 값이 chain_hash 를 돌려주고 있었다 — 이름과 값이 달랐다(codex 지적).
+      sealHash,
+      sealRecord: { evidenceId: sealEvidenceId, chainIndex: sealCols.chain_index },
       sealedAt: approvalResult === 'approved' ? now : undefined,
       createdAt: now,
     },

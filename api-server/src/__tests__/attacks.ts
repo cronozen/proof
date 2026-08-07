@@ -206,9 +206,9 @@ export const ATTACKS: Attack[] = [
     detectedBy: 'serverSignature',
   },
 
-  // ── 🔴 아직 못 막는 것 ─────────────────────────────────────────
+  // ── 롤백 (2026-08-06 봉인 승격으로 막힘) ────────────────────────
   {
-    id: 'gap-rollback-preapproval-signature',
+    id: 'rollback-preapproval-signature',
     what: '승인을 지우고 승인 전 서명을 복원한다',
     impact:
       '승인 기록이 흔적 없이 사라진다. 승인 시 서명이 덮어써지므로, 공격자가 승인 전 서명값을 '
@@ -228,11 +228,41 @@ export const ATTACKS: Attack[] = [
         WHERE evidence_id = ?
       `).run(preApproval.signature, preApproval.alg, preApproval.keyId, ctx.target.evidenceId);
     },
+    // 🎉 2026-08-06 이전까지 knownGap 이었다. 봉인을 체인 레코드로 승격하자 잡히게 됐다 —
+    //    되돌린 행 옆에 봉인 레코드가 체인 안에 그대로 남아 불일치가 드러난다.
+    //    하네스가 "알려진 갭이 이제 탐지된다"고 알려줘서 승격했다.
+    detectedBy: 'seal',
+    detailMatches: /rolled back after it was sealed/i,
+  },
+  {
+    id: 'seal-record-delete',
+    what: '체인에서 봉인 레코드 자체를 지운다',
+    impact: '승인 흔적을 체인째 없애려는 시도 — 체인에 구멍이 생긴다',
+    setup: 'sealed',
+    mutate: ctx => {
+      const target = row(ctx);
+      ctx.db.prepare("DELETE FROM decision_events WHERE type = 'seal' AND seals_decision_id = ?")
+        .run(target.decision_id);
+    },
     detectedBy: 'seal',
     knownGap: {
-      why: '되돌린 상태가 과거의 정당한 상태와 완전히 동일해서, DB 안의 어떤 값으로도 구분할 수 없다',
-      needs: '외부 앵커 (봉인을 체인 레코드로 만들면 앵커가 이걸 덮는다)',
+      why:
+        '봉인 레코드는 체인의 **꼬리**다(승인 시 맨 끝에 붙는다). 꼬리를 지우면 남은 체인은 '
+        + '인덱스가 연속이고 링크도 맞아 정상으로 보인다 — 꼬리 절단의 다른 얼굴이다. '
+        + '다만 응답의 seal.binding 이 chain → row 로 **눈에 띄게 약해진다**',
+      needs: '외부 앵커 (앵커된 헤드가 현재 헤드의 조상인지 대조)',
     },
+  },
+  {
+    id: 'seal-record-retarget',
+    what: '봉인 레코드가 다른 결정을 가리키게 조회 컬럼을 바꾼다',
+    impact: '한 건의 승인을 다른 건으로 옮겨 붙이려는 시도',
+    setup: 'sealed',
+    mutate: ctx => {
+      ctx.db.prepare("UPDATE decision_events SET seals_decision_id = 'dec_somewhere_else' WHERE type = 'seal'")
+        .run();
+    },
+    detectedBy: 'seal',
   },
   {
     id: 'gap-tail-truncation',

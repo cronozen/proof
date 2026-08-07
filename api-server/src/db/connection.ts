@@ -69,6 +69,9 @@ export function initializeDatabase(database: Database.Database): void {
     addColumn('signature', 'signature TEXT');
     addColumn('signature_alg', 'signature_alg TEXT');
     addColumn('signature_key_id', 'signature_key_id TEXT');
+
+    // 2026-08-06: 봉인을 체인 레코드로 승격 — 봉인 레코드가 가리키는 결정.
+    addColumn('seals_decision_id', 'seals_decision_id TEXT');
   }
 
   database.exec(SCHEMA_SQL);

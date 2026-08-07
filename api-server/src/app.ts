@@ -192,6 +192,8 @@ app.get('/verify/:id', (c) => {
       },
       sealHash: row.seal_hash,
       sealedAt: row.sealed_at || null,
+      // 승인이 무엇에 결속돼 있는가 — 'chain' 이어야 외부 앵커가 승인까지 덮는다.
+      sealBinding: result.checks.seal.binding,
     },
 
     coverage: coverage

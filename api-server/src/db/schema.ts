@@ -61,6 +61,11 @@ CREATE TABLE IF NOT EXISTS decision_events (
   signature_alg TEXT,
   signature_key_id TEXT,
 
+  -- 이 레코드가 type='seal' 일 때, 어느 결정을 봉인하는가.
+  -- 🔑 조회용 인덱스일 뿐이고 **권위는 해시된 action_output.targetDecisionId** 다.
+  --    이 컬럼을 고쳐도 해시가 안 맞으므로 봉인 레코드 자체의 검증이 깨진다.
+  seals_decision_id TEXT,
+
   -- Approval
   approver_id TEXT,
   approver_type TEXT,
@@ -91,6 +96,7 @@ CREATE INDEX IF NOT EXISTS idx_decision_events_source ON decision_events(source_
 CREATE INDEX IF NOT EXISTS idx_decision_events_status ON decision_events(status);
 CREATE INDEX IF NOT EXISTS idx_decision_events_chain ON decision_events(chain_domain, chain_index);
 CREATE INDEX IF NOT EXISTS idx_decision_events_idempotency ON decision_events(idempotency_key);
+CREATE INDEX IF NOT EXISTS idx_decision_events_seals ON decision_events(seals_decision_id);
 
 -- 파일 증빙 (업로드형 하네스)
 CREATE TABLE IF NOT EXISTS proof_files (

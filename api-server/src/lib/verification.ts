@@ -69,11 +69,20 @@ export interface DecisionEventRow extends ChainColumns {
   approved_at: string | null;
   sealed_at: string | null;
   created_at: string;
+  seals_decision_id: string | null;
 }
 
 export type { Check };
 
 export type ChainScheme = 'v2' | 'v3';
+
+/**
+ * 승인이 무엇에 결속돼 있는가.
+ *   'chain' — 체인 안의 봉인 레코드 (앵커가 덮는다·롤백이 잡힌다)
+ *   'row'   — 행의 seal_hash 뿐 (체인 밖이라 앵커가 못 덮는다)
+ *   'none'  — 미봉인이거나 결속 없음
+ */
+export type SealBinding = 'chain' | 'row' | 'none';
 
 /**
  * 해시 검사 결과.
@@ -96,7 +105,7 @@ export interface VerificationResult {
      */
     contentCoverage: Check & { contentBound: boolean | null; legacyAccepted: boolean };
     chainLink: Check;
-    seal: Check;
+    seal: Check & { binding: SealBinding };
     serverSignature: SignatureCheck;
     trustedTimestamp: { status: 'not_implemented'; detail: string };
   };
@@ -250,24 +259,101 @@ function readLinkState(db: Database, row: DecisionEventRow): {
  * 승인은 레코드 생성 이후에 일어나므로 chain_hash가 덮지 못한다.
  * seal_hash가 그 공백을 메운다 — 없으면 승인자·승인결과를 자유롭게 바꿀 수 있다.
  */
-function checkSeal(row: DecisionEventRow): Check {
+function checkSeal(db: Database, row: DecisionEventRow): Check & { binding: SealBinding } {
   const isSealed = !!row.sealed_at || !!row.approval_result;
-  const version = row.chain_payload_version ?? 2;
 
-  if (!isSealed) {
-    if (row.seal_hash) {
-      return { ok: false, detail: 'Record carries a seal hash but has no approval — seal was stripped.' };
+  /**
+   * 🔑 체인에서 봉인 레코드를 **직접 찾는다.** 행의 버전 라벨을 보고 "찾을지 말지"를
+   *    결정하지 않는다 — 그러면 그 라벨이 또 하나의 다운그레이드 레버가 된다.
+   *    봉인 레코드는 체인 안에 있으므로, 지우면 링크 검사가 구멍을 잡는다.
+   */
+  //    🔴 조회를 인덱스 컬럼에만 걸면 그 컬럼을 바꾸는 것만으로 봉인이 "없는" 것이 된다.
+  //       권위 필드(해시된 action_output.targetDecisionId)로도 찾아야 한다 —
+  //       그걸 바꾸면 봉인 레코드 자체의 해시가 깨져 다른 검사가 잡는다.
+  //       (2026-08-06 하네스의 seal-record-retarget 이 이 구멍을 잡았다.)
+  const sealRecord = db
+    .prepare(
+      `SELECT * FROM decision_events
+       WHERE chain_domain = ? AND tenant_id = ? AND type = 'seal'
+         AND (seals_decision_id = ? OR action_output LIKE ?)
+       ORDER BY chain_index ASC LIMIT 1`,
+    )
+    .get(
+      row.chain_domain,
+      row.tenant_id,
+      row.decision_id,
+      `%"targetDecisionId":"${row.decision_id}"%`,
+    ) as DecisionEventRow | undefined;
+
+  // ── 봉인 레코드가 체인에 있다 = 이 결정은 승인된 적이 있다 ──
+  if (sealRecord) {
+    let claim: Record<string, unknown>;
+    try {
+      claim = JSON.parse(sealRecord.action_output ?? '{}');
+    } catch {
+      return { ok: false, binding: 'chain', detail: 'Seal record payload is not readable.' };
     }
 
-    // 🔴 봉인 안 된 레코드의 **불변식**.
-    //
-    // chain_hash 는 생성 시점 값만 덮으므로 status·evidence_level·승인자 필드는 그 밖에 있다.
-    // 그래서 `approval_result` 와 `sealed_at` 만 건드리지 않으면, evidence_level 을
-    // 'AUDIT_READY' 로 올리고 승인자 이름을 채워 넣어도 전부 통과했다.
-    // 공개 응답이 evidenceLevel 을 그대로 표시하므로, 승인한 적 없는 건이 감사준비 완료로 보인다.
-    // (2026-08-05 교차검증에서 실제 공격으로 재현됨)
-    //
-    // 해시로 덮을 수 없는 값은 **불변식으로 막는다.** 봉인 전 레코드는 생성 시점 모습이어야 한다.
+    // 봉인 레코드의 권위는 해시된 action_output 이다. 조회용 컬럼과 어긋나면 컬럼이 조작된 것.
+    if (claim.targetDecisionId !== row.decision_id) {
+      return {
+        ok: false,
+        binding: 'chain',
+        detail: 'Seal record found for this decision does not name it as its target.',
+      };
+    }
+
+    // 조회용 컬럼이 권위 필드와 어긋나면 컬럼이 조작된 것이다.
+    if (sealRecord.seals_decision_id !== row.decision_id) {
+      return {
+        ok: false,
+        binding: 'chain',
+        detail: 'Seal record lookup column was altered to point elsewhere.',
+      };
+    }
+
+    // 🔴 롤백 탐지: 체인에 봉인이 있는데 결정 행은 승인이 없다고 말한다.
+    if (!isSealed) {
+      return {
+        ok: false,
+        binding: 'chain',
+        detail:
+          'The chain contains a seal for this decision, but the record shows no approval — '
+          + 'the approval was rolled back after it was sealed.',
+      };
+    }
+
+    const mismatches: string[] = [];
+    const cmp = (field: string, rowValue: unknown, claimValue: unknown) => {
+      if ((rowValue ?? null) !== (claimValue ?? null)) mismatches.push(field);
+    };
+    cmp('approvalResult', row.approval_result, claim.result);
+    cmp('evidenceLevel', row.evidence_level, claim.evidenceLevel);
+    cmp('status', row.status, claim.status);
+    cmp('approverId', row.approver_id, claim.approverId);
+    cmp('approverName', row.approver_name, claim.approverName);
+    cmp('approvedAt', row.approved_at, claim.approvedAt);
+    cmp('sealedAt', row.sealed_at, claim.sealedAt);
+    cmp('sealHash', row.seal_hash, claim.sealHash);
+
+    if (mismatches.length > 0) {
+      return {
+        ok: false,
+        binding: 'chain',
+        detail: `Approval fields disagree with the seal recorded in the chain (${mismatches.join(', ')}).`,
+      };
+    }
+
+    return { ok: true, binding: 'chain' };
+  }
+
+  // ── 봉인 레코드가 없다 ──
+  if (!isSealed) {
+    if (row.seal_hash) {
+      return { ok: false, binding: 'none', detail: 'Record carries a seal hash but has no approval — seal was stripped.' };
+    }
+
+    // 봉인 전 불변식 — 해시로 못 덮는 값은 여기서 막는다.
     const violations: string[] = [];
     if (row.status !== 'recorded') violations.push(`status=${row.status}`);
     if (row.evidence_level && row.evidence_level !== 'DRAFT') violations.push(`evidenceLevel=${row.evidence_level}`);
@@ -280,23 +366,26 @@ function checkSeal(row: DecisionEventRow): Check {
     if (violations.length > 0) {
       return {
         ok: false,
+        binding: 'none',
         detail: `Record is not sealed but carries approval state (${violations.join(', ')}) — approval was forged without a seal.`,
       };
     }
 
-    return { ok: true, detail: 'Not sealed yet (pending approval).' };
+    return { ok: true, binding: 'none', detail: 'Not sealed yet (pending approval).' };
   }
 
-  // seal_hash가 있으면 버전과 무관하게 검증한다.
-  // (레거시 행이라도 v3 배포 이후에 승인됐다면 seal_hash를 받았다 — 있는 것을 안 보면 그게 구멍이다.)
+  // 승인은 있는데 체인에 봉인 레코드가 없다 = 이 결합 방식 도입 이전에 봉인된 행.
+  // 🔴 여기서 "레거시니까 통과"로 끝내면 안 된다 — 결속 강도가 다르다는 걸 응답에 실어야 한다.
+  const version = row.chain_payload_version ?? 2;
   if (!row.seal_hash) {
     if (version < 3) {
       return {
         ok: true,
-        detail: 'Sealed before seal hashing existed (chain payload < v3) — approval fields are not cryptographically bound.',
+        binding: 'none',
+        detail: 'Sealed before seal hashing existed — approval fields are not cryptographically bound.',
       };
     }
-    return { ok: false, detail: 'Record is sealed but carries no seal hash.' };
+    return { ok: false, binding: 'none', detail: 'Record is sealed but carries no seal hash.' };
   }
 
   const recomputed = computeObjectHash(
@@ -319,11 +408,16 @@ function checkSeal(row: DecisionEventRow): Check {
   if (recomputed !== row.seal_hash) {
     return {
       ok: false,
+      binding: 'row',
       detail: 'Recomputed seal hash does not match — approval details were altered after sealing.',
     };
   }
 
-  return { ok: true };
+  return {
+    ok: true,
+    binding: 'row',
+    detail: 'Approval is bound by a row-level seal hash only — it is not part of the chain, so an external anchor does not cover it.',
+  };
 }
 
 // ─── 공개 진입점 ────────────────────────────────────────────────────
@@ -348,7 +442,7 @@ export function verifyRecord(db: Database, row: DecisionEventRow): VerificationR
   const chainLink: Check = core.chainLink;
 
   // 봉인·서명은 호출자마다 모델이 달라 엔진에 올리지 않았다(ops 에는 seal_hash 개념이 없다).
-  const seal = checkSeal(row);
+  const seal = checkSeal(db, row);
   const serverSignature = verifyRecordSignature({
     chainHash: row.chain_hash ?? '',
     sealHash: row.seal_hash,
