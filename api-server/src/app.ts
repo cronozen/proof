@@ -226,14 +226,29 @@ app.get('/verify/:id', (c) => {
       // 🔴 이전의 정당한 상태로 **되돌리는 것**은 안에서 탐지할 수 없다.
       //    승인 전 서명값을 보관했다가 승인 필드를 지우고 그 서명을 복원하면,
       //    메시지가 그 시점과 바이트 단위로 같아서 서명이 그대로 맞는다. 꼬리 절단과 같은 계열이다.
-      'Rollback to an earlier legitimate state (for example removing an approval and restoring the pre-approval ' +
-        'signature) is not detectable from inside the database. Detecting it requires an external anchor.',
+      // 🎉 2026-08-06: 봉인을 체인 레코드로 승격해 이 롤백은 **이제 탐지된다** —
+      //    체인에 봉인 레코드가 남아 있는데 행이 미승인이라고 말하면 불일치로 잡힌다.
+      //    다만 그건 봉인이 체인에 결속된 레코드(sealBinding: 'chain')에만 해당한다.
+      ...(result.checks.seal.binding === 'chain'
+        ? [
+            'This approval is recorded as its own link in the chain, so removing it or rolling it back is '
+              + 'detectable, and an external anchor over the chain head would cover the approval too.',
+          ]
+        : result.checks.seal.binding === 'row'
+          ? [
+              'WARNING: this approval is bound only by a row-level hash, not by a record inside the chain. '
+                + 'An external anchor over the chain would NOT cover it, and rolling the approval back is harder '
+                + 'to detect. Approvals made from 2026-08-06 onward are chain-bound (sealBinding: "chain").',
+            ]
+          : []),
       // 🔴 꼬리 절단은 구조적으로 탐지 불가다. 마지막 N건을 지우면 남은 체인은
       //    인덱스가 연속이고 링크도 맞아 "정상"으로 보인다. 안에서는 풀 수 없는 문제 —
       //    체인의 머리를 밖에 박아두는 외부 앵커가 있어야 한다.
       //    이걸 안 적으면 "verified"가 "아무것도 삭제되지 않았다"로 읽힌다.
       'Truncation is not detectable: if the most recent records were deleted, the remaining chain still ' +
-        'verifies. Detecting a missing tail requires an external anchor, which is not implemented yet.',
+        'verifies. This includes a seal record, which is appended at the tail — deleting it silently downgrades ' +
+        'sealBinding from "chain" to "row". Detecting a missing tail requires an external anchor, which is not ' +
+        'implemented yet.',
       // 🔴 v2 레코드의 "verified: true" 는 실제보다 훨씬 강하게 읽힌다.
       //    해시가 3개 필드만 덮으므로 산출물·AI 근거·승인 결과는 결속되어 있지 않다.
       //    이 사실을 조용히 두면 검증이 없는 것보다 나쁘다.
