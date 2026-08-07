@@ -115,6 +115,43 @@ describe('🎯 적대적 검증 하네스 — 공격 목록 전체', () => {
   });
 });
 
+// ─── 봉인 레코드 자체 ──────────────────────────────────────────────
+
+describe('봉인 레코드도 하나의 체인 레코드다', () => {
+  it('승인 후 봉인 레코드 자신이 검증을 통과한다', async () => {
+    // 🪤 개별 결정 레코드만 검증하면 이게 안 보인다 — 봉인 레코드에 대상의
+    //    evidence_level(AUDIT_READY)을 넣었더니 "승인 없이 AUDIT_READY" 가 되어
+    //    자기 불변식에 걸렸다. PROD 체인 검증이 잡은 결함이라 여기에 못박는다.
+    const domain = 'seal-record-self';
+    const target = await deps.record(domain);
+    await deps.approve(target.decisionId, 'approved');
+
+    const sealRow = db
+      .prepare("SELECT evidence_id FROM decision_events WHERE type = 'seal' AND seals_decision_id = ?")
+      .get(target.decisionId) as { evidence_id: string } | undefined;
+
+    assert.ok(sealRow, '봉인 레코드가 체인에 없다');
+
+    const res = await deps.verify(sealRow.evidence_id);
+    assert.equal(res.verified, true, `봉인 레코드가 검증 실패: ${JSON.stringify(res.failures)}`);
+  });
+
+  it('체인 전체 검증에서 봉인 레코드까지 통과한다', async () => {
+    const domain = 'seal-chain-full';
+    const target = await deps.record(domain);
+    await deps.approve(target.decisionId, 'approved');
+
+    const res = await app.fetch(
+      new Request(`http://localhost/decision-events/verify-chain/${domain}`, {
+        headers: { Authorization: `Bearer ${API_KEY}` },
+      }),
+    );
+    const d = (await res.json() as any).data;
+    assert.equal(d.totalEvents, 2, '결정 1 + 봉인 1 이어야 한다');
+    assert.equal(d.verified, true, `체인 검증 실패: ${JSON.stringify(d.records)}`);
+  });
+});
+
 // ─── 하네스 자체의 성질 ────────────────────────────────────────────
 
 describe('하네스가 스스로 지키는 것', () => {

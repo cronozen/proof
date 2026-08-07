@@ -409,7 +409,12 @@ decisionsRouter.post('/:id/approvals', async (c) => {
     ai_metadata: null,
 
     evidence_id: sealEvidenceId,
-    evidence_level: sealFields.evidence_level,
+    // 🪤 여기에 대상의 evidence_level(AUDIT_READY)을 넣으면 **봉인 레코드 자신이**
+    //    "승인 없이 AUDIT_READY" 가 되어 봉인 전 불변식에 걸린다.
+    //    봉인 레코드는 그 자체로 승인된 것이 아니다 — 승인을 **기록한** 것이다.
+    //    대상의 evidence_level 은 해시된 action_output.evidenceLevel 에 이미 들어 있다.
+    //    (2026-08-07 PROD 체인 검증이 이걸 잡았다. 개별 레코드 검증만으로는 안 보였다.)
+    evidence_level: 'DRAFT',
     chain_index: -1,                      // 트랜잭션 안에서 확정
     previous_hash: null as string | null, // 〃
     chain_domain: row.chain_domain,
