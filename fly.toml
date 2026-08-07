@@ -1,5 +1,21 @@
 app = "cronozen-proof-api"
-primary_region = "nrt"  # Tokyo (서울에서 가장 가까운 Fly 리전)
+
+# 🔴 리전 제약 — 알고 받아들인 선택이다 (2026-03-25 결정, 2026-08-07 재확인)
+#
+# Fly 에는 **한국 리전이 없다**(아시아: 도쿄·싱가포르·시드니). 그래서 증거 원장이 일본에 있다.
+# 원장에는 actor_name·action_output·ai_reasoning·approver_name 이 들어가므로
+# 고객사 운영 데이터이고 승인자 이름은 개인정보다 — 국외이전 판단 대상이다.
+#
+# 지금 옮기지 않는 이유: 외부 고객이 0이라, 옮기면 없는 고객을 위해 최적화하는 것이다.
+# 그리고 Fly 쪽이 운영은 더 단순하다(단일 머신 + SQLite 볼륨, 배포 1분).
+#
+# ⏰ **방아쇠 — 이때 옮긴다**: 공공·금융·의료 감사가 걸린 첫 고객 대화.
+#    그 순간 국내 리전이 요구사항이 되고, AWS ap-northeast-2 로 간다.
+#    그때는 SQLite → Postgres 도 같이 봐야 한다(ECS 에 단일 볼륨 SQLite 는 안 맞는다).
+#    옮기는 비용은 레코드 수에 비례하므로 **미루면 비싸진다** — 이 방아쇠를 놓치지 말 것.
+#
+# 🔴 그때까지 규율: **실제 개인정보를 넣지 않는다.** 원장은 append-only 라 못 지운다.
+primary_region = "nrt"  # Tokyo
 
 [build]
   dockerfile = "Dockerfile"

@@ -23,6 +23,7 @@ import { integrationsRouter, webhooksRouter } from './routes/integrations.js';
 import { getDB } from './db/connection.js';
 import { computeCoverage, verifyRecord, type DecisionEventRow } from './lib/verification.js';
 import { exportPublicKeyPem } from './lib/signing.js';
+import { anchorFreshness } from './lib/anchor-scheduler.js';
 
 /**
  * 🔴 배포 범위 플래그 — **기본 꺼짐**
@@ -97,11 +98,22 @@ app.get('/', (c) => {
 });
 
 app.get('/health', (c) => {
+  // 🔴 앵커 나이를 여기 싣는다. 인프로세스 스케줄러는 자기 자신을 감시하는 것이라 약하다 —
+  //    밖에서 보는 눈이 판정할 수 있어야 한다. 잡이 멈추면 이 값이 자란다.
+  const anchor = anchorFreshness(getDB());
   return c.json({
-    status: 'ok',
+    status: anchor.stale ? 'degraded' : 'ok',
     version: '0.1.0',
     timestamp: new Date().toISOString(),
-  });
+    anchor: {
+      latestAnchoredAt: anchor.latestAnchoredAt,
+      ageSeconds: anchor.ageSeconds,
+      stale: anchor.stale,
+      staleAfterSeconds: anchor.staleAfterSeconds,
+      externallyAttested: anchor.externallyAttested,
+      lastError: anchor.lastError,
+    },
+  }, anchor.stale ? 503 : 200);
 });
 
 // ─── Webhooks (unauthenticated — external services call directly) ──

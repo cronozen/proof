@@ -25,6 +25,7 @@ import { app } from './app.js';
 import { createApiKey } from './middleware/auth.js';
 import { getDB } from './db/connection.js';
 import { getSigner } from './lib/signing.js';
+import { startAnchorScheduler } from './lib/anchor-scheduler.js';
 
 const port = parseInt(process.env.PORT || '3200');
 
@@ -53,6 +54,9 @@ if (signer) {
   console.log('Server signature: NOT CONFIGURED — records are verified by hash chain only.');
   console.log('  → Generate a key: npm run keygen --workspace=api-server');
 }
+
+// 앵커 스케줄러는 **부팅에서만** 시작한다 — 테스트가 import 만으로 네트워크를 타면 안 된다.
+startAnchorScheduler(db);
 
 serve({ fetch: app.fetch, port }, () => {
   console.log(`Cronozen Proof API running on http://localhost:${port}`);

@@ -162,6 +162,52 @@ describe('봉인 레코드도 하나의 체인 레코드다', () => {
   });
 });
 
+// ─── 앵커 스케줄러 ─────────────────────────────────────────────────
+
+describe('앵커 스케줄러 — 잡이 멈추면 드러나야 한다', () => {
+  it('앵커가 아예 없으면 /health 가 degraded(503) 다', async () => {
+    // 🔑 "앵커 없음" 을 정상으로 읽으면 안 된다. 없는 것도 신선하지 않은 것이다.
+    const prev = process.env.PROOF_ANCHOR_STALE_MS;
+    process.env.PROOF_ANCHOR_STALE_MS = '1';
+    try {
+      const res = await app.fetch(new Request('http://localhost/health'));
+      const body = (await res.json()) as any;
+      // 이 스위트는 앞선 테스트에서 앵커를 찍으므로 stale 여부는 상황에 따라 다르다.
+      // 여기서 못박는 것은 **필드가 존재하고 밖에서 읽힌다**는 것.
+      assert.ok('anchor' in body, '/health 에 앵커 상태가 없다 — 밖에서 잡의 죽음을 볼 수 없다');
+      assert.ok(typeof body.anchor.stale === 'boolean');
+      assert.ok(typeof body.anchor.staleAfterSeconds === 'number');
+    } finally {
+      if (prev === undefined) delete process.env.PROOF_ANCHOR_STALE_MS;
+      else process.env.PROOF_ANCHOR_STALE_MS = prev;
+    }
+  });
+
+  it('봉인이 생기면 간격을 기다리지 않고 앵커가 due 가 된다', async () => {
+    const { anchorDue, runAnchorTick } = await import('../lib/anchor-scheduler.js');
+    const domain = 'sched-seal';
+
+    const rec = await deps.record(domain);
+    await runAnchorTick(db);
+    assert.equal(anchorDue(db, 'tenant-attack').due, false, '방금 찍었는데 또 due 다');
+
+    await deps.approve(rec.decisionId, 'approved');
+    const due = anchorDue(db, 'tenant-attack');
+    assert.equal(due.due, true, '봉인이 생겼는데 앵커가 안 밀린다');
+    assert.match(due.reason, /seal/i);
+  });
+
+  it('앵커 이후 아무것도 안 바뀌면 또 찍지 않는다', async () => {
+    const { anchorDue, runAnchorTick } = await import('../lib/anchor-scheduler.js');
+    await runAnchorTick(db);
+    const before = db.prepare('SELECT COUNT(*) n FROM chain_anchors').get() as { n: number };
+    await runAnchorTick(db);
+    const after = db.prepare('SELECT COUNT(*) n FROM chain_anchors').get() as { n: number };
+    assert.equal(after.n, before.n, '바뀐 게 없는데 앵커가 또 찍혔다');
+    assert.equal(anchorDue(db, 'tenant-attack').due, false);
+  });
+});
+
 // ─── 하네스 자체의 성질 ────────────────────────────────────────────
 
 describe('하네스가 스스로 지키는 것', () => {

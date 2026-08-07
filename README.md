@@ -238,6 +238,17 @@ cannot be added after the fact without re-signing history, which would defeat it
 Distribute the public key (also served at `/verify/public-key`) so third parties can verify
 without trusting this server's response.
 
+### Where the ledger lives
+
+The hosted API runs on Fly.io in **Tokyo (`nrt`)**. Fly has no Korean region, so evidence
+recorded through `api.cronozen.com` is stored in Japan. Records can contain actor names,
+action inputs/outputs, AI reasoning and approver names — treat that as customer operational
+data when assessing cross-border storage requirements.
+
+This was a deliberate trade (simplicity of a single machine + SQLite volume) and is revisited
+when a customer has an audit requirement that mandates domestic storage. Self-hosting removes
+the question entirely: the Docker image runs anywhere.
+
 ---
 
 ## Self-Hosted Deployment
