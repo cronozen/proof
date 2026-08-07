@@ -89,6 +89,12 @@ export interface VerificationResult {
   verified: boolean;
   checks: {
     chainHash: ChainHashCheck;
+    /**
+     * 해시가 **내용까지 덮는가** — chainHash 와 별개의 사실이다.
+     * 둘을 한 칸에 뭉치면, 실패 사유가 어느 검사에도 안 붙어
+     * `verified:false` 인데 checks 는 전부 초록인 응답이 나온다.
+     */
+    contentCoverage: Check & { contentBound: boolean | null; legacyAccepted: boolean };
     chainLink: Check;
     seal: Check;
     serverSignature: SignatureCheck;
@@ -372,14 +378,46 @@ export function verifyRecord(db: Database, row: DecisionEventRow): VerificationR
   // 진짜 레거시 행은 이 게이트에서 함께 떨어진다. 그건 부작용이 아니라 정직함이다 —
   // 그 행들의 내용은 애초에 결속된 적이 없어서 "변조되지 않았다"고 말할 근거가 없다.
   // 옛 관대함이 필요한 운영자는 PROOF_ACCEPT_LEGACY_UNBOUND=true 로 명시적으로 켠다.
+  // 🔑 이건 **별도 검사**여야 한다. 실패 사유를 어느 검사에도 안 붙이면
+  //    `verified:false` 인데 checks 는 전부 초록인 자기모순 응답이 나온다
+  //    (2026-08-06 공격 하네스가 실제로 잡았다). 두 사실은 서로 다르다:
+  //      chainHash.ok       = 저장된 해시가 재계산과 일치한다
+  //      contentCoverage.ok = 그 계산이 레코드 내용을 덮는다
   const acceptUnbound = process.env.PROOF_ACCEPT_LEGACY_UNBOUND === 'true';
-  if (core.chainHash.ok && core.chainHash.contentBound === false && !acceptUnbound) {
-    failures.push(
-      'chainHash: the matching computation does not cover the record content ' +
-        `(scheme ${core.chainHash.matchedScheme}). Cannot attest that the outcome, AI reasoning ` +
-        'or approval fields are unchanged. Set PROOF_ACCEPT_LEGACY_UNBOUND=true to accept legacy records.',
-    );
-  }
+  const bound = core.chainHash.contentBound;
+
+  const contentCoverage: Check & { contentBound: boolean | null; legacyAccepted: boolean } =
+    !core.chainHash.ok
+      ? {
+          ok: false,
+          contentBound: null,
+          legacyAccepted: false,
+          detail: 'Not evaluated — the hash itself did not match.',
+        }
+      : bound !== false
+        ? { ok: true, contentBound: bound, legacyAccepted: false }
+        : acceptUnbound
+          ? {
+              ok: true,
+              contentBound: false,
+              legacyAccepted: true,
+              // 🔴 이 서버는 레거시를 받아들이도록 설정돼 있다. 그 사실을 응답에 실어야 한다 —
+              //    안 실으면 검증자가 이 verified:true 를 v3 와 같은 강도로 읽는다.
+              detail:
+                'The matching computation does NOT cover the record content, but this server runs with '
+                + 'PROOF_ACCEPT_LEGACY_UNBOUND=true so it is accepted anyway. The outcome, AI reasoning and '
+                + 'approval fields are not bound by any hash on this record.',
+            }
+          : {
+              ok: false,
+              contentBound: false,
+              legacyAccepted: false,
+              detail:
+                `The matching computation (${core.chainHash.matchedScheme}) does not cover the record content. `
+                + 'Cannot attest that the outcome, AI reasoning or approval fields are unchanged.',
+            };
+
+  if (!contentCoverage.ok) failures.push(`contentCoverage: ${contentCoverage.detail}`);
   // not_configured / not_applicable 은 판정에서 제외한다 — 서명을 안 켠 것이 위조는 아니다.
   // 반대로 missing/invalid 는 실패다: 키가 있는데 서명이 없다면 다운그레이드 시도로 본다.
   if (serverSignature.status === 'invalid' || serverSignature.status === 'missing') {
@@ -390,6 +428,7 @@ export function verifyRecord(db: Database, row: DecisionEventRow): VerificationR
     verified: failures.length === 0,
     checks: {
       chainHash,
+      contentCoverage,
       chainLink,
       seal,
       serverSignature,
