@@ -79,11 +79,18 @@ export function anchorFreshness(db: Database, tenantId?: string): AnchorFreshnes
   const staleAfter = staleAfterMs();
 
   if (!row) {
+    // 🪤 덮을 레코드가 하나도 없으면 앵커가 없는 게 정상이다 — 새 설치를 degraded 로
+    //    보고하면 경보가 늑대가 되고, 진짜 degraded 일 때 아무도 안 본다.
+    //    반대로 **레코드는 있는데 앵커가 없으면** 그건 진짜 안 덮인 상태다.
+    const anyRecords = (tenantId
+      ? db.prepare('SELECT COUNT(*) as n FROM decision_events WHERE tenant_id = ?').get(tenantId)
+      : db.prepare('SELECT COUNT(*) as n FROM decision_events').get()
+    ) as { n: number };
+
     return {
       latestAnchoredAt: null,
       ageSeconds: null,
-      // 앵커가 아예 없는 것도 "신선하지 않다" 로 본다 — 없는 것을 정상으로 읽으면 안 된다.
-      stale: true,
+      stale: anyRecords.n > 0,
       staleAfterSeconds: Math.round(staleAfter / 1000),
       externallyAttested: false,
       lastError: lastErrRow?.error ?? null,
@@ -194,6 +201,13 @@ export function startAnchorScheduler(db: Database): void {
 
   // 프로세스를 붙잡지 않는다 — 종료가 이것 때문에 막히면 안 된다.
   timer.unref?.();
+
+  // 부팅 직후 한 번 돌린다. 안 그러면 재배포 때마다 첫 틱까지 안 덮인 창이 생긴다.
+  setTimeout(() => {
+    runAnchorTick(db)
+      .then(done => { for (const d of done) console.log(`[anchor] anchored tenant=${d.tenantId} (${d.reason})`); })
+      .catch(err => console.error(`[anchor] initial tick failed: ${(err as Error).message}`));
+  }, 3_000).unref?.();
 
   console.log(
     `Anchor scheduler: every ${Math.round(every / 1000)}s `
