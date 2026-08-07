@@ -141,6 +141,27 @@ CREATE TABLE IF NOT EXISTS chain_anchor_heads (
 CREATE INDEX IF NOT EXISTS idx_chain_anchor_heads_lookup
   ON chain_anchor_heads(tenant_id, chain_domain, chain_index);
 
+-- 앵커를 외부 어디에 제출했는가 (제공자별로 한 행)
+--
+-- 🔴 'submitted' 와 'confirmed' 를 뭉치지 않는다. OTS 는 제출 직후엔 캘린더의 약속일 뿐이고
+--    업그레이드를 돌려야 비트코인 증명이 채워진다. 그 둘을 같게 보고하면 false-assurance 다.
+CREATE TABLE IF NOT EXISTS anchor_submissions (
+  anchor_id TEXT NOT NULL,
+  provider TEXT NOT NULL,
+  status TEXT NOT NULL,              -- submitted | confirmed | failed
+  receipt TEXT,
+  external_ref TEXT,
+  verify_url TEXT,
+  error TEXT,
+  submitted_at TEXT NOT NULL,
+  confirmed_at TEXT,
+  attempts INTEGER NOT NULL DEFAULT 1,
+  last_attempt_at TEXT,
+  PRIMARY KEY (anchor_id, provider)
+);
+
+CREATE INDEX IF NOT EXISTS idx_anchor_submissions_status ON anchor_submissions(status, submitted_at);
+
 -- 파일 증빙 (업로드형 하네스)
 CREATE TABLE IF NOT EXISTS proof_files (
   id TEXT PRIMARY KEY,

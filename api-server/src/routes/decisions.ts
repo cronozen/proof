@@ -17,7 +17,7 @@ import {
 } from '../lib/chain-content.js';
 import { signRecord } from '../lib/signing.js';
 import { verifyChain } from '../lib/verification.js';
-import { createAnchor } from '../lib/anchor.js';
+import { createAnchor, submitAnchor } from '../lib/anchor.js';
 import type { AuthContext } from '../middleware/auth.js';
 import type { QuotaInfo } from '../middleware/quota.js';
 
@@ -242,8 +242,27 @@ decisionsRouter.get('/', async (c) => {
  */
 decisionsRouter.post('/anchor', async (c) => {
   const auth = c.get('auth');
-  const result = createAnchor(getDB(), auth.tenantId);
-  return c.json({ data: result }, 201);
+  const db = getDB();
+
+  // 로컬 앵커를 **먼저** 만든다. 외부 제출이 실패해도 그 시점은 남아야 한다 —
+  // 남은 앵커는 다시 제출할 수 있지만, 안 만든 앵커는 그 시점을 영영 못 되찾는다.
+  const anchor = createAnchor(db, auth.tenantId);
+  const submissions = await submitAnchor(db, auth.tenantId, anchor);
+
+  return c.json({
+    data: {
+      ...anchor,
+      submissions: submissions.map(s => ({
+        provider: s.provider,
+        status: s.status,
+        externalRef: s.externalRef,
+        verifyUrl: s.verifyUrl,
+        error: s.error,
+      })),
+      // 🔴 제출된 곳이 없으면 이 앵커는 우리 DB 안에만 있다. 그대로 말한다.
+      externallyAttested: submissions.some(s => s.status === 'confirmed'),
+    },
+  }, 201);
 });
 
 // ─── GET /decision-events/verify-chain/:domain ─────────────────────

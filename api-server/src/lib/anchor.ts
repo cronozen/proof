@@ -34,6 +34,13 @@
 
 import { createHash } from 'crypto';
 import type { Database } from 'better-sqlite3';
+import {
+  anchorStatement,
+  enabledProviders,
+  submitToOts,
+  submitToRekor,
+  type SubmissionResult,
+} from './anchor-providers.js';
 
 export const ANCHOR_TREE_VERSION = 'anchor-v1';
 
@@ -175,6 +182,78 @@ export function createAnchor(db: Database, tenantId: string): CreateAnchorResult
   };
 }
 
+/**
+ * 만든 앵커를 외부 제공자들에 제출한다.
+ *
+ * 앵커 생성(로컬 트랜잭션)과 **분리**돼 있다. 네트워크를 트랜잭션 안에 넣으면
+ * 느린 캘린더 하나가 DB 쓰기 락을 잡고 앉는다. 그리고 제출이 실패해도 앵커는 남아야 한다 —
+ * 남은 앵커는 나중에 다시 제출할 수 있지만, 없는 앵커는 그 시점을 영영 못 되찾는다.
+ *
+ * 실패도 **기록한다.** 조용히 넘어가면 "제출했다" 고 믿으면서 아무 데도 안 간 상태가 된다.
+ */
+export async function submitAnchor(
+  db: Database,
+  tenantId: string,
+  anchor: CreateAnchorResult,
+): Promise<SubmissionResult[]> {
+  const providers = enabledProviders();
+  if (providers.length === 0) return [];
+
+  const statement = anchorStatement({
+    tenantId,
+    treeVersion: ANCHOR_TREE_VERSION,
+    merkleRoot: anchor.merkleRoot,
+    prevRoot: anchor.prevRoot,
+    leafCount: anchor.leafCount,
+    anchoredAt: anchor.anchoredAt,
+  });
+
+  const results: SubmissionResult[] = [];
+  for (const p of providers) {
+    if (p === 'ots') results.push(await submitToOts(anchor.merkleRoot));
+    else if (p === 'rekor') results.push(await submitToRekor(statement));
+  }
+
+  const now = new Date().toISOString();
+  const insert = db.prepare(`
+    INSERT INTO anchor_submissions
+      (anchor_id, provider, status, receipt, external_ref, verify_url, error, submitted_at, confirmed_at, attempts, last_attempt_at)
+    VALUES (@anchor_id, @provider, @status, @receipt, @external_ref, @verify_url, @error, @submitted_at, @confirmed_at, 1, @last_attempt_at)
+    ON CONFLICT(anchor_id, provider) DO UPDATE SET
+      status = excluded.status, receipt = excluded.receipt, external_ref = excluded.external_ref,
+      verify_url = excluded.verify_url, error = excluded.error, confirmed_at = excluded.confirmed_at,
+      attempts = attempts + 1, last_attempt_at = excluded.last_attempt_at
+  `);
+
+  const tx = db.transaction(() => {
+    for (const r of results) {
+      insert.run({
+        anchor_id: anchor.anchorId,
+        provider: r.provider,
+        status: r.status,
+        receipt: r.receipt,
+        external_ref: r.externalRef,
+        verify_url: r.verifyUrl,
+        error: r.error ?? null,
+        submitted_at: now,
+        confirmed_at: r.status === 'confirmed' ? now : null,
+        last_attempt_at: now,
+      });
+    }
+    // 앵커 행에도 가장 강한 상태를 반영한다 — 검증기가 여기만 봐도 되게.
+    const confirmed = results.find(r => r.status === 'confirmed');
+    const submitted = results.find(r => r.status === 'submitted');
+    const best = confirmed ?? submitted;
+    if (best) {
+      db.prepare('UPDATE chain_anchors SET provider = ?, receipt = ?, confirmed_at = ? WHERE id = ?')
+        .run(best.provider, best.receipt, confirmed ? now : null, anchor.anchorId);
+    }
+  });
+  tx.immediate();
+
+  return results;
+}
+
 // ─── 대조 (탐지가 실제로 일어나는 자리) ──────────────────────────────
 
 export type AnchorStatus =
@@ -194,6 +273,8 @@ export interface AnchorCheck {
   /** 🔴 외부 제공자가 없으면 이 앵커는 우리 DB 안에만 있다. 그대로 말한다. */
   provider?: string;
   externallyAttested?: boolean;
+  /** 검증자가 우리 서버를 안 거치고 직접 열어볼 수 있는 곳. */
+  verifyUrl?: string;
 }
 
 /**
@@ -228,12 +309,25 @@ export function checkAnchor(
     };
   }
 
-  const externallyAttested = anchored.provider !== 'none' && !!anchored.confirmed_at;
+  // 🔑 앵커 행의 provider/confirmed_at 은 요약이고, 정본은 제출 표다.
+  //    'confirmed' 인 제출이 하나라도 있어야 제3자가 지금 확인할 수 있다.
+  const confirmedRow = db
+    .prepare(
+      `SELECT s.provider, s.verify_url, s.confirmed_at
+       FROM anchor_submissions s
+       JOIN chain_anchor_heads h ON h.anchor_id = s.anchor_id
+       WHERE h.tenant_id = ? AND h.chain_domain = ? AND s.status = 'confirmed'
+       ORDER BY s.confirmed_at DESC LIMIT 1`,
+    )
+    .get(tenantId, chainDomain) as { provider: string; verify_url: string | null } | undefined;
+
+  const externallyAttested = !!confirmedRow;
   const base = {
     anchoredAt: anchored.anchored_at,
     anchoredIndex: anchored.chain_index,
-    provider: anchored.provider,
+    provider: confirmedRow?.provider ?? anchored.provider,
     externallyAttested,
+    verifyUrl: confirmedRow?.verify_url ?? undefined,
   };
 
   const head = db
