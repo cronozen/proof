@@ -197,6 +197,41 @@ describe('앵커 스케줄러 — 잡이 멈추면 드러나야 한다', () => {
     assert.match(due.reason, /seal/i);
   });
 
+  it('🔴 조용한 시스템은 stale 이 아니다 — 전부 덮였으면 앵커가 오래돼도 정상', async () => {
+    // 프로덕션에서 실제로 난 오보: 안 덮인 레코드 0건인데 age 9,983초로 STALE.
+    // 나이로 판정하면 조용한 시스템이 시간이 지날수록 무조건 degraded 가 되고,
+    // 경보가 늑대가 되면 진짜 degraded 일 때 아무도 안 본다.
+    const { runAnchorTick, anchorFreshness } = await import('../lib/anchor-scheduler.js');
+    await runAnchorTick(db);
+
+    const prev = process.env.PROOF_ANCHOR_STALE_MS;
+    process.env.PROOF_ANCHOR_STALE_MS = '1'; // 임계를 1ms 로 — 나이로 판정하면 무조건 stale 이 된다
+    try {
+      const f = anchorFreshness(db);
+      assert.equal(f.unanchoredForSeconds, null, '안 덮인 레코드가 남아 있다');
+      assert.equal(f.stale, false, '전부 덮였는데 stale 로 보고했다 — 나이로 판정하고 있다');
+    } finally {
+      if (prev === undefined) delete process.env.PROOF_ANCHOR_STALE_MS;
+      else process.env.PROOF_ANCHOR_STALE_MS = prev;
+    }
+  });
+
+  it('안 덮인 레코드가 오래되면 stale 이다', async () => {
+    const { anchorFreshness } = await import('../lib/anchor-scheduler.js');
+    await deps.record('stale-probe'); // 앵커 안 찍고 남겨둔다
+
+    const prev = process.env.PROOF_ANCHOR_STALE_MS;
+    process.env.PROOF_ANCHOR_STALE_MS = '1';
+    try {
+      const f = anchorFreshness(db);
+      assert.ok(f.unanchoredForSeconds !== null, '안 덮인 레코드를 못 찾았다');
+      assert.equal(f.stale, true, '안 덮인 레코드가 있는데 정상이라고 했다');
+    } finally {
+      if (prev === undefined) delete process.env.PROOF_ANCHOR_STALE_MS;
+      else process.env.PROOF_ANCHOR_STALE_MS = prev;
+    }
+  });
+
   it('앵커 이후 아무것도 안 바뀌면 또 찍지 않는다', async () => {
     const { anchorDue, runAnchorTick } = await import('../lib/anchor-scheduler.js');
     await runAnchorTick(db);

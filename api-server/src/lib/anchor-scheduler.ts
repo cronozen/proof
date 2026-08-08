@@ -52,6 +52,11 @@ export interface AnchorFreshness {
   ageSeconds: number | null;
   stale: boolean;
   staleAfterSeconds: number;
+  /**
+   * 아직 어떤 앵커에도 안 덮인 가장 오래된 레코드의 나이(초). 전부 덮였으면 null.
+   * 🔑 **이 값이 실제 위험 창이다** — 마지막 앵커의 나이가 아니다.
+   */
+  unanchoredForSeconds: number | null;
   /** 외부에 확정된 앵커가 하나라도 있는가 */
   externallyAttested: boolean;
   lastError: string | null;
@@ -79,31 +84,42 @@ export function anchorFreshness(db: Database, tenantId?: string): AnchorFreshnes
 
   const staleAfter = staleAfterMs();
 
-  if (!row) {
-    // 🪤 덮을 레코드가 하나도 없으면 앵커가 없는 게 정상이다 — 새 설치를 degraded 로
-    //    보고하면 경보가 늑대가 되고, 진짜 degraded 일 때 아무도 안 본다.
-    //    반대로 **레코드는 있는데 앵커가 없으면** 그건 진짜 안 덮인 상태다.
-    const anyRecords = (tenantId
-      ? db.prepare('SELECT COUNT(*) as n FROM decision_events WHERE tenant_id = ?').get(tenantId)
-      : db.prepare('SELECT COUNT(*) as n FROM decision_events').get()
-    ) as { n: number };
+  /**
+   * 🔑 신선도의 정의 — **"마지막 앵커가 오래됐나" 가 아니다.**
+   *
+   * 조용한 시스템은 새로 쓸 게 없어서 앵커도 안 찍는다(그게 맞다 — 같은 머리를 또 박을 이유가 없다).
+   * 그런데 나이로 판정하면 그런 시스템이 시간이 지날수록 무조건 degraded 가 된다.
+   * 실제로 프로덕션에서 그 일이 났다: 안 덮인 레코드 0건인데 age 9,983초로 STALE 보고.
+   * 경보가 늑대가 되면 진짜 degraded 일 때 아무도 안 본다.
+   *
+   * 옳은 정의는 **"덮였어야 할 것이 아직 안 덮였나"** 다.
+   * 안 덮인 가장 오래된 레코드의 나이가 임계를 넘으면 잡이 죽은 것이다.
+   */
+  const oldestUnanchored = (tenantId
+    ? db.prepare(
+        `SELECT MIN(e.created_at) as t FROM decision_events e
+         WHERE e.tenant_id = ? AND NOT EXISTS (
+           SELECT 1 FROM chain_anchor_heads h
+           WHERE h.tenant_id = e.tenant_id AND h.chain_domain = e.chain_domain AND h.chain_index >= e.chain_index)`,
+      ).get(tenantId)
+    : db.prepare(
+        `SELECT MIN(e.created_at) as t FROM decision_events e
+         WHERE NOT EXISTS (
+           SELECT 1 FROM chain_anchor_heads h
+           WHERE h.tenant_id = e.tenant_id AND h.chain_domain = e.chain_domain AND h.chain_index >= e.chain_index)`,
+      ).get()
+  ) as { t: string | null };
 
-    return {
-      latestAnchoredAt: null,
-      ageSeconds: null,
-      stale: anyRecords.n > 0,
-      staleAfterSeconds: Math.round(staleAfter / 1000),
-      externallyAttested: false,
-      lastError: lastErrRow?.error ?? null,
-    };
-  }
+  const unanchoredAgeMs = oldestUnanchored.t ? Date.now() - new Date(oldestUnanchored.t).getTime() : null;
+  const stale = unanchoredAgeMs !== null && unanchoredAgeMs > staleAfter;
 
-  const ageMs = Date.now() - new Date(row.anchored_at).getTime();
   return {
-    latestAnchoredAt: row.anchored_at,
-    ageSeconds: Math.round(ageMs / 1000),
-    stale: ageMs > staleAfter,
+    latestAnchoredAt: row?.anchored_at ?? null,
+    ageSeconds: row ? Math.round((Date.now() - new Date(row.anchored_at).getTime()) / 1000) : null,
+    stale,
     staleAfterSeconds: Math.round(staleAfter / 1000),
+    // 안 덮인 것이 있으면 얼마나 오래 그랬는지 — 이게 실제 위험 창이다.
+    unanchoredForSeconds: unanchoredAgeMs === null ? null : Math.round(unanchoredAgeMs / 1000),
     externallyAttested: !!confirmed,
     lastError: lastErrRow?.error ?? null,
   };

@@ -110,6 +110,8 @@ app.get('/health', (c) => {
       ageSeconds: anchor.ageSeconds,
       stale: anchor.stale,
       staleAfterSeconds: anchor.staleAfterSeconds,
+      // 실제 위험 창 — 안 덮인 채로 얼마나 지났나. 전부 덮였으면 null.
+      unanchoredForSeconds: anchor.unanchoredForSeconds,
       externallyAttested: anchor.externallyAttested,
       lastError: anchor.lastError,
     },
