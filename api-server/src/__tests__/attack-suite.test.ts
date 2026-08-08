@@ -218,10 +218,15 @@ describe('앵커 스케줄러 — 잡이 멈추면 드러나야 한다', () => {
 
   it('안 덮인 레코드가 오래되면 stale 이다', async () => {
     const { anchorFreshness } = await import('../lib/anchor-scheduler.js');
-    await deps.record('stale-probe'); // 앵커 안 찍고 남겨둔다
+    const rec = await deps.record('stale-probe'); // 앵커 안 찍고 남겨둔다
+
+    // 🪤 방금 만든 레코드는 나이가 0~1ms 라 임계와 경합한다(테스트가 비결정적이 된다).
+    //    시간을 뒤로 밀어 확정적으로 만든다 — 임계 비교 자체를 보는 테스트다.
+    db.prepare('UPDATE decision_events SET created_at = ? WHERE evidence_id = ?')
+      .run(new Date(Date.now() - 60_000).toISOString(), rec.evidenceId);
 
     const prev = process.env.PROOF_ANCHOR_STALE_MS;
-    process.env.PROOF_ANCHOR_STALE_MS = '1';
+    process.env.PROOF_ANCHOR_STALE_MS = '1000';
     try {
       const f = anchorFreshness(db);
       assert.ok(f.unanchoredForSeconds !== null, '안 덮인 레코드를 못 찾았다');
