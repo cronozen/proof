@@ -382,6 +382,39 @@ export async function upgradeOts(receiptJson: string, fetchImpl = fetch): Promis
   };
 }
 
+/**
+ * Rekor 에서 **우리 키로 서명된 항목을 전부 열거**한다.
+ *
+ * 🔑 이게 앵커 소거를 탐지하는 유일한 길이다. 우리 DB 를 읽는 한, 앵커 행이 지워지면
+ *    대조할 것이 없다. 밖에서 되읽어와야 "있어야 할 게 없다" 를 알 수 있다.
+ *
+ * 🪤 hashedrekord 는 성명서의 **해시만** 싣는다 — 원문은 없다. 그래서 지워진 앵커의
+ *    root 값은 되살릴 수 없다. 하지만 되살릴 필요가 없다: Rekor 에 5건인데 우리에게
+ *    2건이면 **3건이 지워진 것**이고, 그 불일치 자체가 탐지다.
+ *
+ * 🪤 format 은 `x509` 다(실측). `pem` 은 422 를 준다 — 허용값은 [pgp x509 minisign ssh tuf].
+ */
+export async function listRekorEntries(fetchImpl = fetch): Promise<string[] | null> {
+  const signer = getAnchorSigner();
+  if (!signer) return null;
+
+  try {
+    const res = await fetchImpl(`${REKOR_URL}/api/v1/index/retrieve`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        publicKey: { format: 'x509', content: Buffer.from(signer.publicKeyPem).toString('base64') },
+      }),
+      signal: AbortSignal.timeout(25_000),
+    });
+    if (!res.ok) return null;
+    const parsed = await res.json();
+    return Array.isArray(parsed) ? (parsed as string[]) : [];
+  } catch {
+    return null;
+  }
+}
+
 /** 앵커 제출 키 생성 — scripts/generate-anchor-key.ts 에서 사용. */
 export function generateAnchorKeyPair(): { privateKeyPem: string; publicKeyPem: string } {
   const { privateKey, publicKey } = generateKeyPairSync('ec', { namedCurve: 'P-256' });

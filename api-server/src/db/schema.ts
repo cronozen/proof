@@ -162,6 +162,19 @@ CREATE TABLE IF NOT EXISTS anchor_submissions (
 
 CREATE INDEX IF NOT EXISTS idx_anchor_submissions_status ON anchor_submissions(status, submitted_at);
 
+-- 외부 로그와의 대조 결과
+--
+-- 🔑 우리 DB 안의 앵커가 지워졌는지는 **밖에서 되읽어야** 안다. 이 표가 그 결과를 담는다.
+--    이 표 자체도 지워질 수 있지만, 대조 잡이 매 틱 다시 돌아 불일치를 되살린다.
+CREATE TABLE IF NOT EXISTS anchor_reconciliation (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  checked_at TEXT NOT NULL,
+  remote_count INTEGER NOT NULL,
+  local_count INTEGER NOT NULL,
+  missing_count INTEGER NOT NULL,
+  detail TEXT
+);
+
 -- 파일 증빙 (업로드형 하네스)
 CREATE TABLE IF NOT EXISTS proof_files (
   id TEXT PRIMARY KEY,

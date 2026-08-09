@@ -287,9 +287,9 @@ export const ATTACKS: Attack[] = [
     detailMatches: /rewritten below the anchor/i,
   },
 
-  // ── 🔴 아직 못 막는 것 ─────────────────────────────────────────
+  // ── 앵커 소거 (2026-08-09 외부 로그 대조로 막힘) ────────────────
   {
-    id: 'gap-truncate-with-anchor-erasure',
+    id: 'truncate-with-anchor-erasure',
     what: '꼬리를 지우면서 앵커 기록까지 함께 지운다',
     impact:
       '앵커가 우리 DB 안에 있는 한, DB 를 쓸 수 있는 자는 앵커도 같이 지운다. '
@@ -300,10 +300,42 @@ export const ATTACKS: Attack[] = [
       ctx.db.prepare('DELETE FROM chain_anchor_heads WHERE chain_domain = ?').run(ctx.domain);
       ctx.db.prepare('DELETE FROM chain_anchors').run();
     },
+    // 🎉 외부 로그(Rekor)에서 우리 키로 서명된 항목을 **열거**해 갯수를 맞추면 드러난다.
+    //    지워진 root 값은 못 되살리지만, 되살릴 필요가 없다 — 불일치 자체가 탐지다.
+    detectedBy: 'anchor',
+    reconcileAfter: true,
+    detailMatches: /deleted locally|external log/i,
+  },
+
+  // ── 🔴 아직 못 막는 것 ─────────────────────────────────────────
+  {
+    id: 'gap-write-and-delete-within-interval',
+    what: '앵커와 앵커 사이에 기록했다가 다음 앵커 전에 지운다',
+    impact:
+      '어떤 앵커에도 실린 적이 없으므로 밖에 흔적이 없다. 그 기록이 존재했다는 것을 '
+      + '아무도 증명할 수 없다 — 앵커 간격이 곧 이 창의 크기다',
+    setup: 'anchored',
+    mutate: ctx => {
+      // 앵커 이후에 새로 쓰고, 앵커를 다시 찍기 전에 지운다
+      ctx.db.prepare(`
+        INSERT INTO decision_events (id, decision_id, type, source_type, status, actor_id, actor_type,
+          action_type, evidence_id, evidence_level, chain_hash, chain_index, previous_hash, chain_domain,
+          chain_payload_version, occurred_at, tenant_id, created_at, updated_at)
+        SELECT lower(hex(randomblob(16))), 'dec_ephemeral', type, source_type, status, actor_id, actor_type,
+          action_type, 'evi_ephemeral', evidence_level, 'e'||substr(chain_hash,2), chain_index+1, chain_hash,
+          chain_domain, chain_payload_version, occurred_at, tenant_id, created_at, updated_at
+        FROM decision_events WHERE evidence_id = ?
+      `).run(ctx.records[2].evidenceId);
+      ctx.db.prepare("DELETE FROM decision_events WHERE evidence_id = 'evi_ephemeral'").run();
+    },
     detectedBy: 'anchor',
     knownGap: {
-      why: '앵커 표가 같은 DB 안에 있어서 함께 지워진다 — 탐지 절차는 섰지만 앵커 자체가 위조 가능하다',
-      needs: '외부 제공자 제출 (OpenTimestamps 등) — root 가 우리 손 밖에 있어야 한다',
+      why:
+        '앵커 사이에 태어나서 앵커 사이에 죽은 기록은 어떤 root 에도 안 들어갔다. '
+        + 'DB 에도 밖에도 흔적이 없으니 존재 자체를 알 수 없다',
+      needs:
+        '앵커 간격을 줄이면 창이 줄지만 0 이 되지는 않는다. 0 으로 만들려면 '
+        + '기록 시점마다 외부 제출이 필요하고, 그건 쓰기 지연·비용과의 교환이다',
     },
   },
 ];

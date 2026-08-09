@@ -73,6 +73,8 @@ export interface Attack {
   detectedBy: CheckName;
   /** 실패 사유가 이 패턴이어야 한다(선택). 문구가 바뀌면 알아채려는 것. */
   detailMatches?: RegExp;
+  /** 공격 후 외부 로그 대조를 돌린다 — 앵커 소거 계열은 이게 있어야 탐지된다. */
+  reconcileAfter?: boolean;
   /**
    * 🔴 아직 못 막는 공격. `true` 면 러너가 **탐지 실패를 기대**한다.
    * 이렇게 표시해두면 (a) 목록에 남아 잊히지 않고 (b) 나중에 막았을 때 러너가
@@ -101,9 +103,19 @@ export interface HarnessDeps {
   verify(evidenceId: string): Promise<VerifyResponse>;
   /** 지금 시점의 체인 머리를 앵커한다. */
   anchor(): Promise<void>;
+  /**
+   * 외부 로그와 대조한다. 공격 **후**에 돌아야 소거가 드러난다 —
+   * 실제 운영에서도 대조 잡이 주기적으로 도는 것이 탐지의 전제다.
+   */
+  reconcile(): Promise<void>;
 }
 
 async function buildSetup(deps: HarnessDeps, attack: Attack, domain: string): Promise<AttackContext> {
+  // 🔑 대조 결과는 **시스템 전역** 상태다(앵커 소거는 특정 레코드가 아니라 원장 전체의 사건).
+  //    그래서 앞선 공격이 남긴 소거 판정이 뒤 공격을 통째로 오염시킨다.
+  //    공격마다 초기화한다 — 이건 격리이지 판정 완화가 아니다.
+  deps.db.prepare('DELETE FROM anchor_reconciliation').run();
+
   const records: { evidenceId: string; decisionId: string }[] = [];
 
   const many = attack.setup === 'chain3' || attack.setup === 'anchored';
@@ -158,6 +170,10 @@ export async function runAttack(deps: HarnessDeps, attack: Attack): Promise<Atta
   }
 
   attack.mutate(ctx);
+
+  // 공격이 끝난 뒤 대조 잡이 한 번 돈다. 이게 없으면 소거를 알 방법이 없다 —
+  // 우리 DB 만 읽어서는 "있어야 할 게 없다" 를 알 수 없기 때문이다.
+  if (attack.reconcileAfter) await deps.reconcile();
 
   const after = await deps.verify(ctx.target.evidenceId);
   const failing = firstFailingCheck(after);

@@ -37,6 +37,8 @@ const { key: API_KEY } = createApiKey('tenant-attack', 'attack suite key');
 after(() => fs.rmSync(tmpDir, { recursive: true, force: true }));
 
 let seq = 0;
+/** 외부 로그가 기억하는 항목들 — 우리가 로컬에서 지워도 여기서는 안 사라진다. */
+const remoteLedger: string[] = [];
 
 const deps: HarnessDeps = {
   db,
@@ -85,6 +87,20 @@ const deps: HarnessDeps = {
     return (await res.json()) as any;
   },
 
+  async reconcile() {
+    // 🔑 원격 목록을 **스텁**한다. 테스트가 남의 인프라에 의존하면 안 되고,
+    //    여기서 보는 것은 "밖에 있는데 여기 없으면 잡는가" 라는 판정 로직이다.
+    const { reconcileAnchors } = await import('../lib/anchor-scheduler.js');
+    const known = (db
+      .prepare("SELECT external_ref FROM anchor_submissions WHERE provider = 'rekor'")
+      .all() as { external_ref: string | null }[])
+      .map(r => /uuid=([0-9a-f]+)/i.exec(r.external_ref ?? '')?.[1])
+      .filter((v): v is string => !!v);
+    // 원격에는 지워지기 전 목록이 그대로 남아 있다고 본다.
+    remoteLedger.push(...known.filter(u => !remoteLedger.includes(u)));
+    await reconcileAnchors(db, async () => remoteLedger);
+  },
+
   async anchor() {
     const res = await app.fetch(
       new Request('http://localhost/decision-events/anchor', {
@@ -93,6 +109,15 @@ const deps: HarnessDeps = {
       }),
     );
     assert.equal(res.status, 201, `anchor failed: ${await res.text()}`);
+    // 제출이 꺼져 있으므로(테스트) rekor 행이 없다. 원격 원장에 가짜 uuid 를 심어
+    // "밖에는 있다" 를 재현한다.
+    const latest = db.prepare('SELECT id FROM chain_anchors ORDER BY anchored_at DESC LIMIT 1').get() as { id: string };
+    const uuid = latest.id.replace(/-/g, '');
+    db.prepare(`INSERT OR REPLACE INTO anchor_submissions
+        (anchor_id, provider, status, receipt, external_ref, verify_url, error, submitted_at, confirmed_at, attempts, last_attempt_at)
+        VALUES (?, 'rekor', 'confirmed', '{}', ?, NULL, NULL, ?, ?, 1, ?)`)
+      .run(latest.id, `logIndex=0 uuid=${uuid}`, new Date().toISOString(), new Date().toISOString(), new Date().toISOString());
+    if (!remoteLedger.includes(uuid)) remoteLedger.push(uuid);
   },
 };
 

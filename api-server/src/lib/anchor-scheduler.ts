@@ -29,7 +29,7 @@
 
 import type { Database } from 'better-sqlite3';
 import { createAnchor, submitAnchor } from './anchor.js';
-import { upgradeOts } from './anchor-providers.js';
+import { listRekorEntries, upgradeOts } from './anchor-providers.js';
 
 /** 앵커 간격. 이 값이 곧 "탐지 못 하는 창" 의 상한이다. */
 export function anchorIntervalMs(): number {
@@ -242,6 +242,67 @@ export async function runOtsUpgradeTick(db: Database): Promise<{ upgraded: numbe
   return { upgraded, pending };
 }
 
+export interface ReconcileResult {
+  remote: number;
+  local: number;
+  missing: number;
+  detail: string;
+}
+
+/**
+ * 외부 로그와 우리 DB 를 대조한다 — **앵커 소거를 잡는 자리**.
+ *
+ * 우리 DB 를 읽는 한 앵커 행이 지워지면 대조할 게 없다. 그래서 Rekor 에서
+ * 우리 키로 서명된 항목을 **전부 열거해** 우리가 아는 것과 갯수를 맞춰본다.
+ * 밖에 5건인데 우리에게 2건이면 3건이 지워진 것이다.
+ *
+ * 🔴 이 표도 지워질 수 있다. 다만 대조 잡이 매 틱 다시 돌아 불일치를 되살린다 —
+ *    영구 증명은 아니고 **한 틱 안에 드러난다**는 성질이다. 그 한계를 응답에 적는다.
+ *
+ * @param lister 테스트에서 원격 목록을 주입한다. 테스트가 네트워크를 타면 안 된다.
+ */
+export async function reconcileAnchors(
+  db: Database,
+  lister: () => Promise<string[] | null> = () => listRekorEntries(),
+): Promise<ReconcileResult | null> {
+  const remote = await lister();
+  if (remote === null) return null; // 키 미설정이거나 조회 실패 — 판정하지 않는다
+
+  // 🔑 **살아있는 앵커**와 비교해야 한다. 제출 기록(anchor_submissions)만 보면,
+  //    공격자가 chain_anchors 만 지웠을 때 "기억" 은 남아 불일치가 0 이 된다.
+  //    JOIN 으로 실제 앵커가 있는 것만 센다 — 앵커가 사라지면 그 항목도 local 에서 빠진다.
+  //    (2026-08-09 하네스가 이 기준 오류를 잡았다.)
+  const localRows = db
+    .prepare(
+      `SELECT s.external_ref FROM anchor_submissions s
+       JOIN chain_anchors a ON a.id = s.anchor_id
+       WHERE s.provider = 'rekor'`,
+    )
+    .all() as { external_ref: string | null }[];
+
+  const localUuids = new Set(
+    localRows
+      .map(r => /uuid=([0-9a-f]+)/i.exec(r.external_ref ?? '')?.[1])
+      .filter((v): v is string => !!v),
+  );
+
+  const missing = remote.filter(u => !localUuids.has(u));
+  const detail = missing.length > 0
+    ? `${missing.length} anchor(s) exist in the external log but not in this database — `
+      + `they were deleted locally. Sample: ${missing.slice(0, 3).join(', ')}`
+    : 'external log and local anchors agree';
+
+  db.prepare(`
+    INSERT INTO anchor_reconciliation (id, checked_at, remote_count, local_count, missing_count, detail)
+    VALUES (1, ?, ?, ?, ?, ?)
+    ON CONFLICT(id) DO UPDATE SET
+      checked_at = excluded.checked_at, remote_count = excluded.remote_count,
+      local_count = excluded.local_count, missing_count = excluded.missing_count, detail = excluded.detail
+  `).run(new Date().toISOString(), remote.length, localUuids.size, missing.length, detail);
+
+  return { remote: remote.length, local: localUuids.size, missing: missing.length, detail };
+}
+
 let timer: ReturnType<typeof setInterval> | null = null;
 
 /**
@@ -260,6 +321,11 @@ export function startAnchorScheduler(db: Database): void {
     runOtsUpgradeTick(db)
       .then(r => { if (r.upgraded > 0) console.log(`[anchor] ots upgraded ${r.upgraded}, still pending ${r.pending}`); })
       .catch(err => console.error(`[anchor] ots upgrade failed: ${(err as Error).message}`));
+
+    // 외부 로그와 대조 — 앵커가 지워졌는지는 밖에서 되읽어야 안다.
+    reconcileAnchors(db)
+      .then(r => { if (r && r.missing > 0) console.error(`[anchor] 🔴 RECONCILE: ${r.detail}`); })
+      .catch(err => console.error(`[anchor] reconcile failed: ${(err as Error).message}`));
   }, every);
 
   // 프로세스를 붙잡지 않는다 — 종료가 이것 때문에 막히면 안 된다.

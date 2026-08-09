@@ -261,7 +261,8 @@ export type AnchorStatus =
   | 'consistent'         // 앵커된 머리가 지금도 체인에 있고 조상이다
   | 'truncated'          // 앵커 시점보다 체인이 짧아졌다
   | 'rewritten'          // 앵커된 위치의 해시가 다르다
-  | 'unanchored_growth'; // 앵커 이후 자란 부분은 아직 안 덮였다(정보성)
+  | 'unanchored_growth'  // 앵커 이후 자란 부분은 아직 안 덮였다(정보성)
+  | 'erased';            // 외부 로그에는 있는데 우리 DB 에 없다 = 앵커가 지워졌다
 
 export interface AnchorCheck {
   ok: boolean;
@@ -300,6 +301,21 @@ export function checkAnchor(
     .get(tenantId, chainDomain) as
     | { chain_index: number; chain_hash: string; anchored_at: string; provider: string; confirmed_at: string | null }
     | undefined;
+
+  // 🔑 앵커가 없다고 곧장 통과시키면 안 된다 — **지워졌을 수도** 있다.
+  //    외부 로그와의 대조 결과가 "밖에는 있는데 여기 없다" 면 그건 소거다.
+  const recon = db
+    .prepare('SELECT missing_count, detail, checked_at FROM anchor_reconciliation WHERE id = 1')
+    .get() as { missing_count: number; detail: string; checked_at: string } | undefined;
+
+  if (recon && recon.missing_count > 0) {
+    return {
+      ok: false,
+      status: 'erased',
+      detail: recon.detail,
+      externallyAttested: true,
+    };
+  }
 
   if (!anchored) {
     return {
