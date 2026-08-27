@@ -1,5 +1,49 @@
 # Changelog
 
+## [0.3.0] - 2026-08-27
+
+### 🔴 Breaking — `canonicalizeFlat` 도 중첩을 비우고 있었다 (0.2.0 이 절반만 고쳤다)
+
+0.2.0 은 `canonicalize` 와 `canonicalizeChainPayload` **둘만** 고쳤다.
+`canonicalizeFlat` 은 그대로였고, 그 위의 `computeObjectHash`·`generatePolicyHash` 가
+**중첩 값 변조를 원리적으로 못 잡았다.**
+
+```js
+computeObjectHash({w:{from:'A'}}) === computeObjectHash({w:{from:'X'}})   // 0.2.0 에서 true
+generatePolicyHash({a:{b:1}})     === generatePolicyHash({a:{b:2}})       // 0.2.0 에서 true
+```
+
+🪤 **이름이 "Flat" 이라 「평면만 다룬다」로 읽히지만 실제 소비자는 중첩을 넣었다** —
+워크플로 정의 해시(`{name, domain, steps:[{name, dependsOn, dpuAction}]}`)가 실제로
+`{"domain":"d","name":"wf","steps":[{"name":"s1"}]}` 로 직렬화돼
+**의존 관계와 액션이 해시 밖에 있었다.** 「변조 감지」라 불리던 것이 그걸 못 했다.
+
+### Changed
+- `canonicalizeFlat()` — `deepSortKeys` 재귀 정렬. **중첩의 모든 필드가 포함된다**
+- `verifyPolicyHash()` — **v2 먼저 / v1 폴백**. 기존 정책 스냅샷이 안 죽는다
+
+### Added
+- `canonicalizeFlatV1()` · `generatePolicyHashV1()` · `computeObjectHashV1()` — **레거시 검증 전용**
+- `verifyPolicyHashDetailed()` → `{ matched, scheme: 'v2'|'v1'|null, contentBound }`
+  🔑 `verifyPolicyHash` 의 `true` 는 v1/v2 를 구분하지 못한다. **구분이 필요하면 이걸 써라.**
+
+### 이주 방법
+
+```ts
+const r = verifyPolicyHashDetailed(policy, stored);
+if (r.matched && r.contentBound) → 무결
+if (r.matched && !r.contentBound) → **v1. 중첩 내용 미보증** — 별도 카테고리로 세어라
+```
+
+🔴 **v1 으로 통과한 것을 「무결」로 보고하지 마라.** v1 은 중첩을 커밋한 적이 없어
+해시가 맞아도 그 내용이 그대로라는 뜻이 아니다.
+🔴 **백필(재계산해 덮기)을 하지 마라.** 재계산해 덮을 수 있는 해시는 증빙이 아니고,
+v1 해시는 재계산해도 중첩 내용에 대해 아무것도 말해주지 않는다.
+
+🪤 **자기 사본을 가진 소비처를 찾아라** — 패키지를 고쳐도 그건 안 고쳐진다.
+(실례: ops `src/lib/decision-proof/verify-policy.ts` 가 같은 버그의 사본을 갖고 있었다)
+
+
 ## [0.2.0] - 2026-08-27
 
 ### 🔴 Breaking — 체인 해시가 내용을 커밋하지 않던 결함 수정

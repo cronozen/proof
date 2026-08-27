@@ -9,7 +9,12 @@
  */
 
 import { createHash } from 'crypto';
-import { canonicalizeChainPayload, canonicalizeChainPayloadV1, canonicalizeFlat } from './canonicalize';
+import {
+  canonicalizeChainPayload,
+  canonicalizeChainPayloadV1,
+  canonicalizeFlat,
+  canonicalizeFlatV1,
+} from './canonicalize';
 
 // ==================== Chain Hash ====================
 
@@ -77,9 +82,34 @@ export function verifyPolicyHash(
   policyConfig: Record<string, unknown>,
   expectedHash: string
 ): boolean {
-  const computedHash = generatePolicyHash(policyConfig);
-  return computedHash === expectedHash;
+  // 🔑 v2 먼저, v1 폴백. 저장된 라벨을 안 믿고 **실제로 맞은 계산**이 진실이다.
+  // 🔴 v1 으로 맞은 것을 「무결」로 보고하지 마라 — v1 은 중첩 내용을 커밋한 적이 없다.
+  //    구분이 필요하면 verifyPolicyHashDetailed 를 써라.
+  return (
+    generatePolicyHash(policyConfig) === expectedHash ||
+    generatePolicyHashV1(policyConfig) === expectedHash
+  );
 }
+
+/**
+ * 정책 해시 검증 — **어느 계산이 맞았는지 돌려준다.**
+ *
+ * 🔑 `verifyPolicyHash` 의 `true` 는 v1/v2 를 구분하지 못한다.
+ *    v1 일치는 「시각·형태는 맞으나 **중첩 내용은 미보증**」이다. 초록에 섞지 마라.
+ */
+export function verifyPolicyHashDetailed(
+  policyConfig: Record<string, unknown>,
+  expectedHash: string
+): { matched: boolean; scheme: 'v2' | 'v1' | null; contentBound: boolean } {
+  if (generatePolicyHash(policyConfig) === expectedHash) {
+    return { matched: true, scheme: 'v2', contentBound: true };
+  }
+  if (generatePolicyHashV1(policyConfig) === expectedHash) {
+    return { matched: true, scheme: 'v1', contentBound: false };
+  }
+  return { matched: false, scheme: null, contentBound: false };
+}
+
 
 // ==================== Generic Content Hash ====================
 
@@ -105,4 +135,22 @@ export function computeContentHash(content: string): string {
 export function computeObjectHash(data: Record<string, unknown>): string {
   const content = canonicalizeFlat(data);
   return createHash('sha256').update(content).digest('hex');
+}
+
+/**
+ * v1 레거시 정책 해시 (기존 정책 스냅샷 검증용)
+ *
+ * @deprecated 새 해시는 generatePolicyHash (v2) 사용
+ */
+export function generatePolicyHashV1(policyConfig: Record<string, unknown>): string {
+  return createHash('sha256').update(canonicalizeFlatV1(policyConfig)).digest('hex');
+}
+
+/**
+ * v1 레거시 객체 해시 (기존 해시 검증용)
+ *
+ * @deprecated 새 해시는 computeObjectHash (v2) 사용
+ */
+export function computeObjectHashV1(data: Record<string, unknown>): string {
+  return createHash('sha256').update(canonicalizeFlatV1(data)).digest('hex');
 }

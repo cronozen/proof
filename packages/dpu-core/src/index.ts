@@ -32,6 +32,7 @@ export {
 export {
   canonicalize,
   canonicalizeFlat,
+  canonicalizeFlatV1,
   canonicalizeChainPayload,
   canonicalizeChainPayloadV1,
 } from './canonicalize';
@@ -45,6 +46,9 @@ export {
   verifyPolicyHash,
   computeContentHash,
   computeObjectHash,
+  computeObjectHashV1,
+  generatePolicyHashV1,
+  verifyPolicyHashDetailed,
 } from './hash';
 
 // ==================== Verification (판정 SSoT) ====================
