@@ -5,7 +5,11 @@
  * 체인 링크 생성/조회/검증 판정은 @cronozen/dpu-pro에서 제공합니다.
  *
  * @version 1.0
- * @locked computeChainHash의 직렬화 규칙은 기존 체인 호환을 위해 변경 금지
+ * @locked 🪤 **이 잠금은 이미 두 번 깨졌다** — 0.2.0 이 `canonicalizeChainPayload` 를,
+ *         0.3.0 이 `canonicalizeFlat` 을 고쳤다. 둘 다 **내용을 커밋하지 않는 결함**이라
+ *         고치는 게 맞았고, 호환은 **V1 함수를 남기는 방식**으로 지켰다.
+ *         ⇒ 잠금의 진짜 뜻은 「바꾸지 마라」가 아니라
+ *           **「기존 해시를 재현할 수 있는 경로를 없애지 마라」** 다.
  */
 
 import { createHash } from 'crypto';
@@ -82,13 +86,18 @@ export function verifyPolicyHash(
   policyConfig: Record<string, unknown>,
   expectedHash: string
 ): boolean {
-  // 🔑 v2 먼저, v1 폴백. 저장된 라벨을 안 믿고 **실제로 맞은 계산**이 진실이다.
-  // 🔴 v1 으로 맞은 것을 「무결」로 보고하지 마라 — v1 은 중첩 내용을 커밋한 적이 없다.
-  //    구분이 필요하면 verifyPolicyHashDetailed 를 써라.
-  return (
-    generatePolicyHash(policyConfig) === expectedHash ||
-    generatePolicyHashV1(policyConfig) === expectedHash
-  );
+  // 🔴 2026-08-27 — **strict v2 단독이다. v1 폴백을 여기 넣지 마라.**
+  //    한 번 넣었다가 되돌렸다. 이유:
+  //    · v1 은 중첩을 커밋한 적이 없다 ⇒ **v1 해시로 저장된 정책은 중첩을 변조해도
+  //      v1 재계산이 그대로 맞는다.** 폴백을 기본값에 두면 이 릴리스가 고친 변조 불감이
+  //      boolean API 에서 그대로 재현된다.
+  //    · 0.2.0 은 strict 였다. 폴백을 넣으면 **어제 false 이던 것이 오늘 true 가 된다** —
+  //      검증을 느슨하게 만드는 릴리스가 된다.
+  //    · `verify.ts` 가 스스로 적었다: 「v1 match 를 contentBound true 로 보고한 것은
+  //      **검증이 없는 것보다 나쁘다**」. boolean 은 그 구분을 뭉갠다.
+  //  🔑 레거시가 필요하면 `verifyPolicyHashDetailed` 로 **명시적으로** 받아라.
+  //     `scheme:'v1'` 은 「맞았지만 내용 미보증」이지 「무결」이 아니다.
+  return generatePolicyHash(policyConfig) === expectedHash;
 }
 
 /**

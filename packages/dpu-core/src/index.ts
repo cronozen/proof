@@ -13,7 +13,7 @@
  * 거버넌스 가드, 컴플라이언스 판정, 책임 그래프는
  * @cronozen/dpu-pro에서 제공합니다.
  *
- * @version 0.1.0
+ * @version 0.3.0
  * @license Apache-2.0
  */
 

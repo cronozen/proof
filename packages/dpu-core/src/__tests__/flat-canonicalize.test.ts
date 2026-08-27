@@ -10,6 +10,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  canonicalize,
   canonicalizeFlat,
   canonicalizeFlatV1,
   computeObjectHash,
@@ -72,11 +73,27 @@ describe('🔑 ops graphHash 실사례 — 의존관계·액션 변조가 안 �
   });
 });
 
-describe('폴백 검증 — v2 먼저, v1 은 별도 칸', () => {
+describe('🔴 verifyPolicyHash 는 strict — v1 폴백을 기본값에 두지 않는다', () => {
   const policy = { a: { b: 1 } };
 
-  it('v1 으로 만든 해시가 verifyPolicyHash 로 통과한다 (기존 스냅샷이 안 죽는다)', () => {
-    assert.equal(verifyPolicyHash(policy, generatePolicyHashV1(policy)), true);
+  it('🔴 v1 해시는 boolean API 로 통과하지 않는다', () => {
+    // 한 번 폴백을 넣었다가 되돌렸다. v1 은 중첩을 커밋한 적이 없어
+    // **v1 해시로 저장된 정책은 중첩을 변조해도 v1 재계산이 그대로 맞는다.**
+    // 폴백이 기본값이면 이 릴리스가 고친 변조 불감이 boolean 에서 재현된다.
+    assert.equal(verifyPolicyHash(policy, generatePolicyHashV1(policy)), false);
+  });
+
+  it('🔴 그 위험을 실증한다 — v1 은 중첩 변조본도 통과시킨다', () => {
+    const tampered = { a: { b: 999 } };
+    // v1 계산으로는 원본과 변조본이 같은 해시다(중첩을 안 덮으므로)
+    assert.equal(generatePolicyHashV1(policy), generatePolicyHashV1(tampered));
+    // 그래서 boolean 이 v1 을 받아주면 변조본이 통과한다 — 지금은 차단된다
+    assert.equal(verifyPolicyHash(tampered, generatePolicyHashV1(policy)), false);
+  });
+
+  it('🪤 0.2.0 도 strict 였다 — 폴백은 검증을 느슨하게 만드는 변경이었다', () => {
+    // 어제 false 이던 것이 오늘 true 가 되면 그건 수리가 아니라 회귀다.
+    assert.equal(verifyPolicyHash(policy, generatePolicyHashV1(policy)), false);
   });
 
   it('v2 도 통과한다', () => {
@@ -97,5 +114,32 @@ describe('폴백 검증 — v2 먼저, v1 은 별도 칸', () => {
     assert.deepEqual(verifyPolicyHashDetailed(policy, 'deadbeef'), {
       matched: false, scheme: null, contentBound: false,
     });
+  });
+});
+
+describe('🔴 toJSON 을 존중한다 — v2 가 Date 를 뭉개고 있었다', () => {
+  it('Date 가 ISO 문자열로 커밋된다', () => {
+    assert.equal(canonicalizeFlat({ a: new Date('2026-01-01T00:00:00.000Z') }), '{"a":"2026-01-01T00:00:00.000Z"}');
+  });
+
+  it('🔴 Date 값이 다르면 해시가 다르다 — 안 그러면 v1 보다 나쁘다', () => {
+    assert.notEqual(computeObjectHash({ a: new Date(0) }), computeObjectHash({ a: new Date(99999) }));
+  });
+
+  it('🪤 v1 은 toJSON 을 탔다 — own-enumerable 만 복사하면 그게 끊긴다', () => {
+    // 이 결함의 교훈: 「중첩을 조용히 버리는 해시 함수를 남기면 안 된다」가
+    // v2 자신에게도 적용된다. Date 는 own key 가 0개라 `{}` 로 뭉개졌었다.
+    assert.equal(canonicalizeFlatV1({ a: new Date(0) }).includes('1970-01-01'), true);
+  });
+
+  it('중첩된 toJSON 도 탄다', () => {
+    assert.equal(canonicalizeFlat({ n: { d: new Date(0) } }), '{"n":{"d":"1970-01-01T00:00:00.000Z"}}');
+  });
+});
+
+describe('🪤 canonicalizeFlat 은 canonicalize 의 alias 다 (deprecated)', () => {
+  it('두 함수가 같은 결과를 낸다 — 이름이 만든 착각을 코드로 없앤다', () => {
+    const x = { b: { d: 1, c: 2 }, a: 3, arr: [{ z: 1, y: 2 }] };
+    assert.equal(canonicalizeFlat(x), canonicalize(x));
   });
 });

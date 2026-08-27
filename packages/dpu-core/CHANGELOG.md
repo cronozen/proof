@@ -20,7 +20,12 @@ generatePolicyHash({a:{b:1}})     === generatePolicyHash({a:{b:2}})       // 0.2
 
 ### Changed
 - `canonicalizeFlat()` — `deepSortKeys` 재귀 정렬. **중첩의 모든 필드가 포함된다**
-- `verifyPolicyHash()` — **v2 먼저 / v1 폴백**. 기존 정책 스냅샷이 안 죽는다
+- `deepSortKeys` — 🔴 **`toJSON` 을 존중한다.** own-enumerable 키만 복사하면 프로토타입의
+  `toJSON` 이 끊겨 **Date 가 `{}` 로 뭉개졌다**(0.2.0 부터의 회귀). `v1` 이 오히려 나았던 자리다.
+- `canonicalizeFlat()` — **`canonicalize` 의 `@deprecated` alias 로 강등.**
+  🪤 이름이 「평면만 다룬다」는 착각을 만들었고 **그 착각이 8개월간 이 결함을 살렸다.**
+  0.4.0 에서 제거 예정.
+- `verifyPolicyHash()` — 🔴 **strict v2 단독 유지**(0.2.0 과 동일). 폴백을 넣었다가 되돌렸다
 
 ### Added
 - `canonicalizeFlatV1()` · `generatePolicyHashV1()` · `computeObjectHashV1()` — **레거시 검증 전용**
@@ -29,19 +34,35 @@ generatePolicyHash({a:{b:1}})     === generatePolicyHash({a:{b:2}})       // 0.2
 
 ### 이주 방법
 
+🔴 **`verifyPolicyHash` 는 v1 을 통과시키지 않는다.** 레거시는 **명시적으로** 받아라:
+
 ```ts
 const r = verifyPolicyHashDetailed(policy, stored);
 if (r.matched && r.contentBound) → 무결
 if (r.matched && !r.contentBound) → **v1. 중첩 내용 미보증** — 별도 카테고리로 세어라
+if (!r.matched)                   → 불일치
 ```
+
+🪤 **폴백을 boolean 기본값에 두지 마라 — 한 번 넣었다가 되돌렸다.**
+v1 은 중첩을 커밋한 적이 없어 **v1 해시로 저장된 것은 중첩을 변조해도 v1 재계산이 그대로 맞는다.**
+기본값에 두면 이 릴리스가 고친 변조 불감이 boolean API 에서 재현되고,
+**0.2.0 에서 `false` 이던 것이 `true` 가 된다** — 수리가 아니라 회귀다.
 
 🔴 **v1 으로 통과한 것을 「무결」로 보고하지 마라.** v1 은 중첩을 커밋한 적이 없어
 해시가 맞아도 그 내용이 그대로라는 뜻이 아니다.
 🔴 **백필(재계산해 덮기)을 하지 마라.** 재계산해 덮을 수 있는 해시는 증빙이 아니고,
 v1 해시는 재계산해도 중첩 내용에 대해 아무것도 말해주지 않는다.
 
-🪤 **자기 사본을 가진 소비처를 찾아라** — 패키지를 고쳐도 그건 안 고쳐진다.
-(실례: ops `src/lib/decision-proof/verify-policy.ts` 가 같은 버그의 사본을 갖고 있었다)
+🔴 **자기 사본을 가진 소비처를 찾아라 — 패키지를 고쳐도 그건 안 고쳐진다.**
+실례 둘, 그리고 **두 번째가 훨씬 크다**:
+1. ops `src/lib/decision-proof/verify-policy.ts` — 같은 버그의 함수 사본
+2. 🔴 **ops `packages/dpu-core` 전체가 vendored 사본이다.**
+   `tsconfig.json` 이 `@cronozen/dpu-core` → `packages/dpu-core/src` 로 매핑하고
+   node_modules 도 workspace 심볼릭 링크다. ⇒ **npm 에 올려도 ops 는 1비트도 안 바뀐다.**
+   ops 의 유일한 실제 결함 지점(`src/core/automation/engine.ts:620` `graphHash` —
+   `dependsOn`·`dpuAction` 변조를 못 잡는다)은 **그 사본을 동기화해야 고쳐진다.**
+   🪤 그리고 `dpu-pro`·`dpu-connector-prisma` 가 `"@cronozen/dpu-core": "0.1.0"` **정확 핀**이라,
+      사본 버전을 올리면 workspace 매칭이 깨져 **npm 의 완전 결함 0.1.0 을 조용히 끌어온다.**
 
 
 ## [0.2.0] - 2026-08-27
