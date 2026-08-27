@@ -7,7 +7,7 @@
   "module": "dist/index.mjs",
   "types": "dist/index.d.ts",
   "bin": {
-    "cronozen-dpu": "./dist/cli/index.js"
+    "cronozen-dpu": "dist/cli/index.js"
   },
   "exports": {
     ".": {
@@ -57,12 +57,15 @@
   ],
   "repository": {
     "type": "git",
-    "url": "https://github.com/cronozen/thearound-ops",
+    "url": "git+https://github.com/cronozen/proof.git",
     "directory": "packages/dpu-core"
   },
   "author": "Cronozen (thearound Inc.)",
-  "homepage": "https://github.com/cronozen/thearound-ops/tree/main/packages/dpu-core",
+  "homepage": "https://github.com/cronozen/proof/tree/main/packages/dpu-core",
   "engines": {
     "node": ">=18"
+  },
+  "bugs": {
+    "url": "https://github.com/cronozen/proof/issues"
   }
 }
