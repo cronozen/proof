@@ -20,7 +20,18 @@ generatePolicyHash({a:{b:1}})     === generatePolicyHash({a:{b:2}})       // 0.2
 
 ### Changed
 - `canonicalizeFlat()` — `deepSortKeys` 재귀 정렬. **중첩의 모든 필드가 포함된다**
-- `deepSortKeys` — 🔴 **`toJSON` 을 존중한다.** own-enumerable 키만 복사하면 프로토타입의
+- `deepSortKeys` — 🔴 **own-key 0개 객체를 조용히 뭉개지 않는다.** 넷을 고쳤다:
+  · **`toJSON` 존중** — Date 가 `{}` 로 뭉개지던 것(아래)
+  · **`Object.create(null)`** — `__proto__` 키가 프로토타입 setter 로 흘러 **조용히 소실**됐다.
+    실측: `{"__proto__":{"evil":1},"a":1}` → `{"a":1}`. ⇒ **second-preimage**(서로 다른 원본이 같은 해시)
+  · **Map/Set 거부** — Date 와 같은 부류(own-key 0개)인데 `toJSON` 도 없다.
+    `{}` 로 뭉개면 내용이 해시 밖으로 나간다. 조용히 비우느니 **거부**한다
+  · **순환 참조 거부** — 스택 오버플로 대신 명시적 에러.
+    🪤 판정은 **현재 경로(ancestor)** 다. 「본 적 있는 것 전부」로 두면
+    형제가 같은 객체를 참조하는 **DAG 가 순환으로 오판**된다(실제 데이터에 흔하다)
+  · 🪤 BigInt 는 `JSON.stringify` 가 거부하게 둔다 — 조용히 문자열로 바꾸면
+    `1n` 과 `"1"` 이 같은 해시가 된다. **모르는 건 거부한다**
+  · (원래 항목) 🔴 **`toJSON` 을 존중한다.** own-enumerable 키만 복사하면 프로토타입의
   `toJSON` 이 끊겨 **Date 가 `{}` 로 뭉개졌다**(0.2.0 부터의 회귀). `v1` 이 오히려 나았던 자리다.
 - `canonicalizeFlat()` — **`canonicalize` 의 `@deprecated` alias 로 강등.**
   🪤 이름이 「평면만 다룬다」는 착각을 만들었고 **그 착각이 8개월간 이 결함을 살렸다.**

@@ -20,30 +20,63 @@
 /**
  * 객체의 모든 키를 재귀적으로 알파벳순 정렬
  */
-function deepSortKeys(value: unknown): unknown {
+function deepSortKeys(value: unknown, seen: WeakSet<object> = new WeakSet()): unknown {
   if (value === null || value === undefined || typeof value !== 'object') {
+    // 🪤 BigInt 는 여기서 통과해 JSON.stringify 가 throw 한다. **그게 맞다** —
+    //    조용히 문자열로 바꾸면 `1n` 과 `"1"` 이 같은 해시가 된다. 모르는 건 거부한다.
     return value;
   }
-  // 🔴 2026-08-27 — `toJSON` 을 먼저 존중한다.
+
+  // 🔴 순환 참조 — 스택 오버플로 대신 명시적으로 거부한다.
+  //    해시 입력에 순환이 있으면 그건 「정규화 불가」이지 「어쩌다 깊은 객체」가 아니다.
+  // 🪤 `seen` 은 **현재 경로**(ancestor)지 「본 적 있는 것 전부」가 아니다.
+  //    후자로 두면 형제가 같은 객체를 참조하는 **DAG 가 순환으로 오판**된다 —
+  //    `{a: shared, b: shared}` 는 순환이 아니고 실제 데이터에 흔하다.
+  //    그래서 자식 순회가 끝나면 지운다(아래 `seen.delete`).
+  if (seen.has(value)) {
+    throw new TypeError('canonicalize: 순환 참조는 해시 입력이 될 수 없다');
+  }
+  seen.add(value);
+
+  // 🔴 `toJSON` 을 먼저 존중한다 (2026-08-27).
   //    own-enumerable 키만 복사하면 **프로토타입의 `toJSON` 이 끊긴다.**
-  //    Date 는 own key 가 0개라 `{}` 로 뭉개졌다:
-  //      canonicalize({a: new Date(...)})  →  '{"a":{}}'
-  //      ⇒ Date 값이 달라도 같은 해시. **v1 보다 나빴다**(v1 은 toJSON 을 탔다).
-  //    Date·Decimal·BigNumber 등 toJSON 을 프로토타입에 둔 모든 클래스가 같은 부류다.
-  //    「중첩을 조용히 버리는 해시 함수를 남기면 안 된다」가 이 함수 자신에게 적용된다.
+  //    Date 는 own key 가 0개라 `{}` 로 뭉개졌다 ⇒ 값이 달라도 같은 해시. **v1 보다 나빴다.**
   const maybe = value as { toJSON?: () => unknown };
   if (typeof maybe.toJSON === 'function') {
-    // toJSON 결과가 또 객체일 수 있으므로 재귀. 🪤 자기 자신을 돌려주면 무한루프이므로 끊는다.
-    const primitive = maybe.toJSON();
-    return primitive === value ? String(value) : deepSortKeys(primitive);
+    const projected = maybe.toJSON();
+    // 🪤 자기 자신을 돌려주면 무한루프다.
+    const out = projected === value ? String(value) : deepSortKeys(projected, seen);
+    seen.delete(value);
+    return out;
   }
+
   if (Array.isArray(value)) {
-    return value.map(deepSortKeys);
+    const out = value.map((v) => deepSortKeys(v, seen));
+    seen.delete(value);
+    return out;
   }
-  const sorted: Record<string, unknown> = {};
+
+  // 🔴 own-enumerable 키가 0개인데 내용이 있는 것들 — `toJSON` 도 없다.
+  //    Date 와 **정확히 같은 부류**다. `{}` 로 뭉개면 내용이 해시 밖으로 나간다.
+  //    조용히 비우느니 거부한다 — 소비자가 자기 표현을 정해서 넘겨야 한다.
+  if (value instanceof Map || value instanceof Set) {
+    seen.delete(value);
+    throw new TypeError(
+      'canonicalize: Map/Set 은 해시 입력이 될 수 없다 — 배열/객체로 바꿔서 넘겨라',
+    );
+  }
+
+  // ⚠️ `Object.create(null)` 필수 — 일반 `{}` 에 `out["__proto__"] = x` 는
+  //    **프로토타입 setter 로 흘러 키가 조용히 소실된다.**
+  //    JSON 필드에 중첩 `__proto__` 가 오면 그 내용이 해시 밖으로 빠져
+  //    **second-preimage**(서로 다른 원본이 같은 해시)가 난다.
+  //    실측: `{"__proto__":{"evil":1},"a":1}` → `{"a":1}` 로 evil 이 사라졌다.
+  //    (ops `src/lib/decision-proof/commitment.ts` 가 같은 방어를 먼저 했다)
+  const sorted: Record<string, unknown> = Object.create(null);
   for (const key of Object.keys(value as Record<string, unknown>).sort()) {
-    sorted[key] = deepSortKeys((value as Record<string, unknown>)[key]);
+    sorted[key] = deepSortKeys((value as Record<string, unknown>)[key], seen);
   }
+  seen.delete(value);
   return sorted;
 }
 

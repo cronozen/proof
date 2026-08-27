@@ -143,3 +143,44 @@ describe('🪤 canonicalizeFlat 은 canonicalize 의 alias 다 (deprecated)', ()
     assert.equal(canonicalizeFlat(x), canonicalize(x));
   });
 });
+
+describe('🔴 own-key 0개 객체 / 프로토타입 오염 / 순환 — 조용히 뭉개지 않는다', () => {
+  it('🔴 `__proto__` 키가 살아남는다 — second-preimage 방어', () => {
+    // 일반 `{}` 에 `out["__proto__"] = x` 는 **프로토타입 setter 로 흘러 키가 조용히 소실된다.**
+    // 실측: {"__proto__":{"evil":1},"a":1} → {"a":1} 로 evil 이 해시 밖으로 나갔다.
+    // ⇒ 서로 다른 원본이 같은 해시를 낸다. `Object.create(null)` 로 막는다.
+    const withProto = JSON.parse('{"__proto__":{"evil":1},"a":1}');
+    assert.equal(canonicalize(withProto), '{"__proto__":{"evil":1},"a":1}');
+    assert.notEqual(computeObjectHash(withProto), computeObjectHash({ a: 1 }));
+  });
+
+  it('🔴 Map/Set 은 거부한다 — `{}` 로 뭉개면 내용이 해시 밖으로 나간다', () => {
+    // Date 와 **정확히 같은 부류**다(own-enumerable 키 0개). 단 toJSON 도 없다.
+    // 조용히 비우느니 거부한다 — 소비자가 자기 표현을 정해서 넘겨야 한다.
+    assert.throws(() => canonicalize({ a: new Map([['k', 1]]) }), /Map\/Set/);
+    assert.throws(() => canonicalize({ a: new Set([1]) }), /Map\/Set/);
+  });
+
+  it('🔴 순환 참조는 거부한다 — 스택 오버플로 대신 명시적으로', () => {
+    const o: Record<string, unknown> = { a: 1 };
+    o.self = o;
+    assert.throws(() => canonicalize(o), /순환 참조/);
+
+    const arr: unknown[] = [1];
+    arr.push(arr);
+    assert.throws(() => canonicalize({ arr }), /순환 참조/);
+  });
+
+  it('🪤 DAG 는 순환이 아니다 — 형제가 같은 객체를 참조해도 통과한다', () => {
+    // `seen` 을 「본 적 있는 것 전부」로 두면 이게 순환으로 오판된다.
+    // **현재 경로(ancestor)** 여야 한다 — 실제 데이터에 흔한 모양이다.
+    const shared = { x: 1 };
+    assert.equal(canonicalize({ a: shared, b: shared }), '{"a":{"x":1},"b":{"x":1}}');
+    assert.equal(canonicalize({ l: [shared, shared] }), '{"l":[{"x":1},{"x":1}]}');
+  });
+
+  it('🪤 BigInt 는 JSON.stringify 가 거부한다 — 그게 맞다', () => {
+    // 조용히 문자열로 바꾸면 `1n` 과 `"1"` 이 같은 해시가 된다. 모르는 건 거부한다.
+    assert.throws(() => canonicalize({ a: 1n as unknown }));
+  });
+});
