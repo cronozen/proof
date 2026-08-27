@@ -4,13 +4,14 @@
   "description": "Cronozen Decision Proof public schema - types, enums, JSON-LD definitions",
   "license": "Apache-2.0",
   "author": "Cronozen <dev@cronozen.com> (https://cronozen.com)",
-  "homepage": "https://github.com/cronozen/dp-schema-public#readme",
+  "homepage": "https://github.com/cronozen/proof/tree/main/packages/dp-schema-public",
   "bugs": {
-    "url": "https://github.com/cronozen/dp-schema-public/issues"
+    "url": "https://github.com/cronozen/proof/issues"
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/cronozen/dp-schema-public.git"
+    "url": "git+https://github.com/cronozen/proof.git",
+    "directory": "packages/dp-schema-public"
   },
   "main": "dist/index.js",
   "module": "dist/index.mjs",
