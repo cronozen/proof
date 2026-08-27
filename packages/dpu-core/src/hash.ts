@@ -97,27 +97,44 @@ export function verifyPolicyHash(
   //      **검증이 없는 것보다 나쁘다**」. boolean 은 그 구분을 뭉갠다.
   //  🔑 레거시가 필요하면 `verifyPolicyHashDetailed` 로 **명시적으로** 받아라.
   //     `scheme:'v1'` 은 「맞았지만 내용 미보증」이지 「무결」이 아니다.
+  //  🪤 그 API 에서도 **`matched` 만 보면 폴백이 되살아난다** — `scheme` 을 봐라.
   return generatePolicyHash(policyConfig) === expectedHash;
 }
 
 /**
  * 정책 해시 검증 — **어느 계산이 맞았는지 돌려준다.**
  *
- * 🔑 `verifyPolicyHash` 의 `true` 는 v1/v2 를 구분하지 못한다.
- *    v1 일치는 「시각·형태는 맞으나 **중첩 내용은 미보증**」이다. 초록에 섞지 마라.
+ * 🔑 `verifyPolicyHash` 는 **strict v2 단독**이라 v1 저장분을 통과시키지 않는다.
+ *    레거시를 봐야 하면 이걸 쓰되 — 🔴 **`matched` 만 보지 마라.**
+ *    그러면 strict 에서 제거한 폴백이 이 API 를 통해 되살아난다.
+ *    판정은 `scheme` 과 `contentBound` 로 한다:
+ *      scheme:'v2'  → 내용까지 커밋된 무결
+ *      scheme:'v1'  → **시각·형태만 맞다. 중첩 내용 미보증** — 별도 카테고리로 세어라
+ *
+ * 🪤 `contentBound` 는 실패 시 `null` 이다 — 「내용을 안 덮었다」가 아니라
+ *    **「일치한 스킴이 없어 판정 불가」**다. `verify.ts` 의 `LinkState` 가 같은 원칙이다.
+ *
+ * 🪤 `contentBound: true` 도 **무조건 참이 아니다** — 입력이 허용 JSON 도메인 안에 있을 때만이다.
+ *    (도메인 밖 값은 `canonicalize` 가 거부하므로 여기까지 오지 않는다)
  */
+export type PolicyHashVerdict =
+  | { matched: true; scheme: 'v2'; contentBound: true }
+  | { matched: true; scheme: 'v1'; contentBound: false }
+  | { matched: false; scheme: null; contentBound: null };
+
 export function verifyPolicyHashDetailed(
   policyConfig: Record<string, unknown>,
   expectedHash: string
-): { matched: boolean; scheme: 'v2' | 'v1' | null; contentBound: boolean } {
+): PolicyHashVerdict {
   if (generatePolicyHash(policyConfig) === expectedHash) {
     return { matched: true, scheme: 'v2', contentBound: true };
   }
   if (generatePolicyHashV1(policyConfig) === expectedHash) {
     return { matched: true, scheme: 'v1', contentBound: false };
   }
-  return { matched: false, scheme: null, contentBound: false };
+  return { matched: false, scheme: null, contentBound: null };
 }
+
 
 
 // ==================== Generic Content Hash ====================

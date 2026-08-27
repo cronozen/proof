@@ -29,14 +29,23 @@ generatePolicyHash({a:{b:1}})     === generatePolicyHash({a:{b:2}})       // 0.2
   · **순환 참조 거부** — 스택 오버플로 대신 명시적 에러.
     🪤 판정은 **현재 경로(ancestor)** 다. 「본 적 있는 것 전부」로 두면
     형제가 같은 객체를 참조하는 **DAG 가 순환으로 오판**된다(실제 데이터에 흔하다)
-  · 🪤 BigInt 는 `JSON.stringify` 가 거부하게 둔다 — 조용히 문자열로 바꾸면
-    `1n` 과 `"1"` 이 같은 해시가 된다. **모르는 건 거부한다**
+  · 🔴 **JSON 도메인 밖 원시값을 거부한다** — 전부 second-preimage 였다(실측):
+    `NaN`·`±Infinity`·**Invalid Date** → 모두 `null` ⇒ **진짜 `null` 과 충돌** ·
+    `undefined` → 객체에선 키 소실(`{a:undefined}` == `{}`), 배열에선 `null` ·
+    `-0` → `0` · `BigInt`(`1n` == `"1"`) · `Symbol`·function(조용히 사라짐)
+    🪤 **Invalid Date 는 위 거부를 통과하는 유일한 경로**였다 — 거부는 입력을 보는데
+       이건 `toJSON` 이 만들어낸 `null` 이라 안 걸린다. 따로 막았다
+  · 🪤 `toJSON` 이 **자기 자신을 반환**하면 거부한다 — `String(value)` 폴백은 서로 다른 객체를
+    `"[object Object]"` 하나로 뭉갠다
   · (원래 항목) 🔴 **`toJSON` 을 존중한다.** own-enumerable 키만 복사하면 프로토타입의
   `toJSON` 이 끊겨 **Date 가 `{}` 로 뭉개졌다**(0.2.0 부터의 회귀). `v1` 이 오히려 나았던 자리다.
 - `canonicalizeFlat()` — **`canonicalize` 의 `@deprecated` alias 로 강등.**
   🪤 이름이 「평면만 다룬다」는 착각을 만들었고 **그 착각이 8개월간 이 결함을 살렸다.**
   0.4.0 에서 제거 예정.
 - `verifyPolicyHash()` — 🔴 **strict v2 단독 유지**(0.2.0 과 동일). 폴백을 넣었다가 되돌렸다
+- `verifyPolicyHashDetailed()` — **discriminated union** 으로. 실패 시 `contentBound: null`
+  (「내용을 안 덮었다」가 아니라 **「일치한 스킴이 없어 판정 불가」**. `verify.ts` 의 `LinkState` 와 같은 원칙)
+  🔴 **`matched` 만 보지 마라** — 그러면 strict 에서 제거한 폴백이 이 API 로 되살아난다. `scheme` 을 봐라
 
 ### Added
 - `canonicalizeFlatV1()` · `generatePolicyHashV1()` · `computeObjectHashV1()` — **레거시 검증 전용**

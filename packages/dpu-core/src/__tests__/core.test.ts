@@ -80,9 +80,12 @@ describe('canonicalize()', () => {
     assert.equal(result, '{"a":null,"b":1}');
   });
 
-  it('strips undefined values (JSON.stringify behavior)', () => {
-    const result = canonicalize({ a: undefined, b: 1 });
-    assert.equal(result, '{"b":1}');
+  it('🔴 undefined 를 **거부한다** — 예전엔 조용히 버렸다(0.3.0 에서 뒤집음)', () => {
+    // 옛 동작: `{a: undefined, b: 1}` → `'{"b":1}'` 로 키가 사라졌다.
+    // ⇒ `{a: undefined}` 와 `{}` 가 **같은 해시**였다(second-preimage).
+    //    「JSON.stringify 동작이니까」라는 이유로 고정돼 있었는데,
+    //    해시 입력으로는 그게 결함이다. 모르는 건 거부한다.
+    assert.throws(() => canonicalize({ a: undefined, b: 1 }), /undefined/);
   });
 
   it('handles string, number, boolean, null types', () => {

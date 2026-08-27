@@ -112,7 +112,7 @@ describe('🔴 verifyPolicyHash 는 strict — v1 폴백을 기본값에 두지 
   it('둘 다 아니면 불일치', () => {
     assert.equal(verifyPolicyHash(policy, 'deadbeef'), false);
     assert.deepEqual(verifyPolicyHashDetailed(policy, 'deadbeef'), {
-      matched: false, scheme: null, contentBound: false,
+      matched: false, scheme: null, contentBound: null,
     });
   });
 });
@@ -182,5 +182,78 @@ describe('🔴 own-key 0개 객체 / 프로토타입 오염 / 순환 — 조용�
   it('🪤 BigInt 는 JSON.stringify 가 거부한다 — 그게 맞다', () => {
     // 조용히 문자열로 바꾸면 `1n` 과 `"1"` 이 같은 해시가 된다. 모르는 건 거부한다.
     assert.throws(() => canonicalize({ a: 1n as unknown }));
+  });
+});
+
+describe('🔴 JSON 도메인 밖 원시값 — 조용히 충돌시키지 않고 거부한다', () => {
+  // codex 지적. 전부 second-preimage 였다(실측):
+  //   NaN · ±Infinity · Invalid Date → 전부 `null` ⇒ 진짜 null 과 충돌
+  //   undefined(객체) → 키 소실 ⇒ {a:undefined} == {}
+  //   undefined(배열) → null   ⇒ [undefined] == [null]
+  //   -0 → 0
+  it('🔴 NaN·Infinity 를 거부한다 — null 로 직렬화되어 진짜 null 과 충돌한다', () => {
+    assert.throws(() => canonicalize({ a: NaN }), /NaN/);
+    assert.throws(() => canonicalize({ a: Infinity }), /Infinity/);
+    assert.throws(() => canonicalize({ a: -Infinity }), /Infinity/);
+  });
+
+  it('🔴 -0 을 거부한다 — 0 으로 직렬화된다', () => {
+    assert.throws(() => canonicalize({ a: -0 }), /-0/);
+    assert.equal(canonicalize({ a: 0 }), '{"a":0}'); // 0 은 정상
+  });
+
+  it('🔴 undefined 를 거부한다 — 객체에선 키가 사라지고 배열에선 null 이 된다', () => {
+    assert.throws(() => canonicalize({ a: undefined }), /undefined/);
+    assert.throws(() => canonicalize({ l: [undefined] }), /undefined/);
+  });
+
+  it('🔴 Invalid Date 를 거부한다 — toJSON 이 null 을 돌려줘 진짜 null 과 충돌한다', () => {
+    // 🪤 위 원시값 거부를 **통과해버리는 유일한 경로**다 —
+    //    거부는 입력을 보는데 이건 toJSON 이 만들어낸 null 이라 안 걸린다.
+    assert.throws(() => canonicalize({ a: new Date('nope') }), /Invalid Date/);
+    assert.equal(canonicalize({ a: null }), '{"a":null}'); // 진짜 null 은 정상
+  });
+
+  it('🔴 Symbol·function·BigInt 를 거부한다 — 조용히 사라지거나 throw 한다', () => {
+    assert.throws(() => canonicalize({ a: Symbol('s') as unknown }));
+    assert.throws(() => canonicalize({ a: (() => 1) as unknown }));
+    assert.throws(() => canonicalize({ a: 1n as unknown }), /BigInt/);
+  });
+
+  it('정상 JSON 값은 그대로 통과한다', () => {
+    assert.equal(canonicalize({ n: 1.5, s: 'x', b: true, z: null, l: [1, 'a'] }),
+      '{"b":true,"l":[1,"a"],"n":1.5,"s":"x","z":null}');
+  });
+});
+
+describe('🪤 codex 가 지적한 테스트 사각 — 고정 벡터와 배열 내부', () => {
+  it('🔑 **고정 벡터** — 해시 알고리즘이 바뀌면 잡는다', () => {
+    // 이 파일이 값의 「동일/상이 관계」만 봐서 SHA-256 을 다른 알고리즘으로 바꿔도
+    // 안 빨개졌다. 리터럴로 못 박는다.
+    assert.equal(canonicalize({ b: 2, a: 1 }), '{"a":1,"b":2}');
+    assert.equal(
+      computeObjectHash({ a: 1, b: 2 }),
+      '43258cff783fe7036d8a43033f830adfc60ec037382473548ac742b888292777',
+    );
+  });
+
+  it('배열 원소 객체의 키도 정렬된다 — alias 검사만으로는 안 잡혔다', () => {
+    // 두 함수가 **같은 잘못된 구현**을 공유하면 alias 비교는 통과한다.
+    assert.equal(canonicalize({ l: [{ z: 1, a: 2 }] }), '{"l":[{"a":2,"z":1}]}');
+  });
+
+  it('배열 안 Date 도 ISO 로 커밋된다', () => {
+    assert.equal(canonicalize({ l: [new Date(0)] }), '{"l":["1970-01-01T00:00:00.000Z"]}');
+  });
+
+  it('🪤 Date 가 아닌 **커스텀 toJSON** 도 탄다 — Date 만 특별처리하면 잡힌다', () => {
+    const custom = { toJSON: () => ({ z: 1, a: 2 }) };
+    assert.equal(canonicalize({ c: custom }), '{"c":{"a":2,"z":1}}');
+  });
+
+  it('🔴 toJSON 이 자기 자신을 반환하면 거부한다 — String() 폴백은 서로 다른 객체를 뭉갠다', () => {
+    const selfRef: Record<string, unknown> = {};
+    selfRef.toJSON = () => selfRef;
+    assert.throws(() => canonicalize({ a: selfRef }), /toJSON/);
   });
 });
