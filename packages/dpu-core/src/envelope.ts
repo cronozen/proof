@@ -18,7 +18,7 @@ import type {
   AIMode,
   SixWFields,
 } from '@cronozen/dp-schema-public';
-import { computeChainHash, computeContentHash } from './hash';
+import { computeChainHash, computeContentHash, CHAIN_HASH_VERSION } from './hash';
 import type { DPURecord, ChainLinkResult } from './adapter';
 
 // ==================== Input Types ====================
@@ -27,6 +27,12 @@ import type { DPURecord, ChainLinkResult } from './adapter';
  * DPU Envelope 생성 입력
  */
 export interface CreateEnvelopeInput {
+  /**
+   * 법적 적용 범위. 생략하면 DB 기본값(스키마에 따라 `'individual'` 등)이 적용된다.
+   * ⚠️ `null` 을 명시하지 말 것 — 컬럼이 NOT NULL 인 스키마에서 Prisma 가 거부한다.
+   */
+  legal_scope?: string;
+
   // Required
   domain: string;
   purpose: string;
@@ -187,7 +193,13 @@ export function createDPUEnvelope(
 
     // Responsibility
     final_responsible: input.final_responsible,
-    legal_scope: null,
+    // ⚠️ legal_scope 는 **키를 내보내지 않는다**.
+    // DB 컬럼이 `NOT NULL DEFAULT 'individual'` 인 스키마에서 여기서 `null` 을 명시하면
+    // Prisma 가 "Argument `legal_scope` must not be null" 로 거부한다 — 생략하면 기본값이 들어간다.
+    // 실피해(ops, 2026-08-01): automation 워크플로 DPU 가 **30일 넘게 매일 100% 실패**하고
+    // 있었고 catch 가 삼켜서 아무 신호도 없었다.
+    // 호출자가 값을 주면 그대로 쓰고, 안 주면 **DB 기본값에 맡긴다**(기본값을 코드에 복제하지 않는다).
+    ...(input.legal_scope !== undefined ? { legal_scope: input.legal_scope } : {}),
 
     // Evidence
     evidence_level: input.evidence_level,
@@ -203,6 +215,15 @@ export function createDPUEnvelope(
     chain_hash: chainHash,
     chain_index: chainIndex,
     chain_domain: input.domain,
+
+    // 🔴 **생성 시점의 provenance 를 원자적으로 같이 남긴다.**
+    // 이게 없으면 레코드가 스킴 라벨 없이 태어나 검증기가 읽을 값이 없고,
+    // 그 행은 영구히 **v1 폴백 대상**이 된다 — 즉 「내용을 커밋했다」고 말할 수 없게 된다.
+    // 나중에 재계산해 채우는 건 답이 아니다: **재계산해 덮을 수 있는 값은 증빙이 아니다.**
+    // 여기 넣는 건 **실제로 해시에 넘긴** content·timestamp 다. 재구성하지 않는다.
+    chain_hash_version: CHAIN_HASH_VERSION,
+    chain_timestamp: timestamp,
+    chain_content: chainContent,
 
     // 6W
     six_w: input.six_w ? (input.six_w as unknown as Record<string, unknown>) : null,

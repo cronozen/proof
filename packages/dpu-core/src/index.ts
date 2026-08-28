@@ -40,6 +40,7 @@ export {
 // ==================== Hash Functions ====================
 
 export {
+  CHAIN_HASH_VERSION,
   computeChainHash,
   computeChainHashV1,
   generatePolicyHash,

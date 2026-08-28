@@ -1,5 +1,48 @@
 # Changelog
 
+## [0.3.1] - 2026-08-28
+
+### 🔴 Fix — 발행본이 **자기가 만든 레코드의 provenance 를 안 남기고 있었다**
+
+0.2.0·0.3.0 은 해시 **계산**을 고쳤지만, `createDPUEnvelope` 가 그 계산의 출처를
+레코드에 **영속하지 않았다.**
+
+```
+0.3.0 이 만든 레코드:  chain_hash_version 없음 · chain_timestamp 없음 · chain_content 없음
+```
+
+⇒ 검증기가 「이 해시는 어느 스킴으로 만들어졌나」를 읽을 값이 없어 **영구히 v1 폴백 대상**이
+된다. v1 은 내용을 커밋하지 않으므로, 그 레코드는 **「내용을 커밋했다」고 말할 수 없다.**
+해시를 고쳐 놓고 그 사실을 기록하지 않으면 고친 값어치가 레코드에 도달하지 않는다.
+
+🔴 **백필로 못 고친다** — 나중에 재계산해 덮을 수 있는 값은 증빙이 아니다.
+   이 수정 **이후** 생성분부터 provenance 가 붙는다.
+
+**추가된 영속 필드** (`DPURecord` / `DPUEnvelope`)
+- `chain_hash_version` — 계산 스킴 라벨 (`CHAIN_HASH_VERSION`)
+- `chain_timestamp` — 해시에 **실제로 투입된** ISO-8601 원문. `executed_at` 과 다를 수 있다
+- `chain_content` — 해시 content 원문 전체(키 목록이 아니라 **값까지**)
+
+### 🔴 Fix — `legal_scope` 가 `null` 로 하드코딩돼 있었다
+
+호출자가 무엇을 넘기든 무시하고 `null` 을 썼다. 컬럼이 `NOT NULL DEFAULT …` 인 스키마에서
+이건 단순 무시가 아니라 **쓰기 실패**다 — Prisma 가 `Argument \`legal_scope\` must not be null`
+로 거부한다. 내부 배포(ops)에서 같은 모양의 버그가 워크플로 DPU 를 **30일 넘게 매일 100%
+실패**시켰고, catch 가 삼켜 아무 신호도 없었다.
+
+이제 **키를 아예 내보내지 않는다**(호출자가 주면 그대로, 안 주면 DB 기본값).
+기본값을 코드에 복제하지 않는다.
+
+### 🔴 Fix — `CHAIN_HASH_VERSION` 이 export 되지 않았다
+
+상수가 패키지 안에만 있고 공개 API 에 없었다. 소비자가 `'v2'` 를 **손으로 재현**하게 되고,
+스킴이 올라가는 날 그 사본만 뒤처져 검증이 갈린다. 이제 export 한다.
+
+### 마이그레이션
+`0.3.0` 이하로 쓴 레코드는 provenance 가 없다. **백필하지 말고 경계로 다뤄라** —
+`chain_hash_version IS NULL` 을 `legacyCount` 로 **세어서 보고**한다.
+🪤 라벨은 해시 밖이라 뗄 수 있다. 접두로만 인정해라(v2 뒤 v1 = invalid, 다운그레이드 차단).
+
 ## [0.3.0] - 2026-08-27
 
 ### 🔴 Breaking — `canonicalizeFlat` 도 중첩을 비우고 있었다 (0.2.0 이 절반만 고쳤다)

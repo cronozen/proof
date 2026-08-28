@@ -78,6 +78,23 @@ export interface DPURecord {
   chain_hash?: string | null;
   chain_index?: number | null;
   chain_domain?: string | null;
+  /**
+   * chain_hash 를 만든 계산 스킴 provenance ('v1' | 'v2' | null).
+   * 🔴 검증기가 **라벨 없이 v1 폴백을 무제한 허용**하면 위조 통과 경로가 된다.
+   * null = 이 필드가 배선되기 전 생성분 → 폴백 허용(막으면 정상 레코드가 대량 오판).
+   */
+  chain_hash_version?: string | null;
+  /**
+   * 해시에 **실제로 투입된** ISO-8601 원문 문자열. `executed_at` 과 다를 수 있다
+   * (writer 마다 timestamp 소스가 갈릴 수 있다). 재직렬화 값을 넣으면 안 된다.
+   */
+  chain_timestamp?: string | null;
+  /**
+   * 해시 content 원문 전체 — 키 목록이 아니라 **값까지**.
+   * 이게 없으면 검증기가 필드 조합을 추측해야 하고, 추측으로는 재계산이 안 되는
+   * 레코드가 실제로 생긴다.
+   */
+  chain_content?: Record<string, unknown> | null;
 
   // 6W
   six_w?: Record<string, unknown> | null;

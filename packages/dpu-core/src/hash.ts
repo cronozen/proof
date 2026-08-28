@@ -39,6 +39,20 @@ import {
  *   '2026-02-10T00:00:00+09:00'
  * );
  */
+/**
+ * 체인 해시 **계산 스킴** 라벨.
+ *
+ * 해시를 만드는 구현이 이 파일 하나뿐이므로 라벨도 여기 하나만 둔다.
+ * 두 벌로 두면 계산은 바뀌었는데 라벨만 남아 **검증기가 틀린 스킴으로 재계산**한다.
+ *
+ * ⚠️ `canonicalizeChainPayload` 규칙이 바뀌면 반드시 올린다.
+ * ⚠️ 이건 **계산 스킴**이지 신뢰 출처가 아니다 — "생성 시점 원자 저장"과
+ *    "재계산 일치 추론"(백필분)의 구분을 여기 섞지 말 것.
+ * 🔴 이 상수를 export 하지 않으면 소비자가 `'v2'` 를 **손으로 재현**하게 되고,
+ *    스킴이 올라간 날 그 사본만 뒤처져 검증이 갈린다. 0.3.0 이 그 상태였다.
+ */
+export const CHAIN_HASH_VERSION = 'v2';
+
 export function computeChainHash(
   dpuContent: Record<string, unknown>,
   previousHash: string | null,
