@@ -71,6 +71,25 @@ export {
   type VerificationVerdict,
 } from './verify';
 
+// ==================== 재계산 후보 생성 (검증 파이프라인 앞단) ====================
+//
+// 🔑 위의 판정 엔진은 후보를 **받아서** 판정한다. 후보를 만들 줄 모르면 core 로는
+//    검증이 끝까지 안 되고, 그건 「우리를 믿어라」다. 그래서 이쪽도 무료다.
+// 🪤 벌크 순회·DB 질의·조직 스코프·리포팅은 여기 없다 — 그건 배포판의 몫이다.
+
+export {
+  buildChainHashCandidates,
+  diffStoredContentAgainstRow,
+  strictLegacyFallback,
+  CHAIN_CORE_FIELDS,
+  type BuiltChainHashCandidate,
+  type BuildCandidateOptions,
+  type ChainCoreField,
+  type ChainHashScheme,
+  type ChainVerificationRow,
+  type LegacyFallbackPolicy,
+} from './chain-verification';
+
 // ==================== Envelope ====================
 
 export {

@@ -1,5 +1,57 @@
 # Changelog
 
+## [0.4.0] - 2026-08-28
+
+### 검증 primitive 를 무료로 — 후보 생성기가 core 에 들어왔다
+
+`verify.ts` 는 판정 **엔진**이다(후보 → verdict). 그 앞단인 **후보 생성기**가 없어서,
+지금까지 이 패키지로는 "이 저장된 해시가 맞는가" 를 끝까지 답할 수 없었다.
+해시를 만들 줄만 알고 검증을 못 하는 core 는 **「우리를 믿어라」**다.
+
+**추가**
+- `buildChainHashCandidates(row, options?)` — 재계산 후보 전량 생성
+- `diffStoredContentAgainstRow(storedContent, row)` — 저장 복사본 ↔ 행 대조
+- `strictLegacyFallback` · `CHAIN_CORE_FIELDS`
+- 타입: `BuiltChainHashCandidate` · `BuildCandidateOptions` · `ChainVerificationRow` ·
+  `ChainCoreField` · `ChainHashScheme` · `LegacyFallbackPolicy`
+
+### 🔴 기본 폴백 정책은 **엄격**하다
+
+`chain_hash_version` 이 명시적으로 `'v1'` 일 때만 v1 폴백을 준다.
+**라벨이 없는(null) 레코드에는 폴백을 주지 않는다.**
+
+v1 은 직렬화가 content 를 비워 내용을 커밋하지 않는다. 라벨 없는 행에 폴백을 열어주면
+**provenance 컬럼을 제어할 수 있는 쪽이 검증 기준을 고르게 된다**(라벨을 지우면
+내용 무관 통과 경로가 열린다).
+
+🪤 자기 배포판의 레거시 분포는 이 기본값이 아니라 **compatibility profile 로 명시**하라 —
+그래야 관용이 눈에 보인다:
+```ts
+buildChainHashCandidates(row, { allowLegacyV1Fallback: s => s !== 'v2' })
+```
+
+### 🔑 `contentBound` 는 저장 복사본이 **행과 일치할 때만** 참이다
+
+`chain_content` 는 작성자가 해시에 넣은 원문의 **복사본**이다. 그 복사본으로 계산한
+후보가 맞아도, **행을 UPDATE 하면 해시는 여전히 맞고 행은 달라져 있다.**
+감사인이 읽는 것은 행이다.
+
+그래서 후보를 만들 때 대조까지 하고 결과를 싣는다:
+- v2 · 행 기준 → `contentBound: true`
+- v2 · 저장 복사본 → **복사본이 행과 일치할 때만** `true`
+- v1 → 언제나 `false`
+
+`evaluateChainHash` 가 이 값을 verdict 에 그대로 싣기 때문에, 여기서 과대주장하면
+그 거짓이 판정문까지 간다.
+
+### 이름
+엔진 타입 `ChainHashCandidate`(0.3.1 에 이미 발행)는 **그대로 둔다.** 직접 후보를 만드는
+소비자는 `source` 를 가질 이유가 없다. 확장형은 `BuiltChainHashCandidate` 다.
+
+### 이 릴리스에 **없는** 것
+벌크 순회 · DB 질의 · 조직 스코프 · 관리자 감사 리포팅 · commitment 원장 · 외부 앵커 운영.
+그건 배포판의 몫이다. 🪤 벌크 검증은 모트가 아니다 — O(n) 루프는 누구나 다시 쓴다.
+
 ## [0.3.1] - 2026-08-28
 
 ### 🔴 Fix — 발행본이 **자기가 만든 레코드의 provenance 를 안 남기고 있었다**

@@ -225,14 +225,20 @@ export 하지 않는다**(dist grep 0건). 소비자가 `'v2'` 를 손으로 재
 실제로 `event_data`(없는 컬럼)·`decision_proof_units`(모델명 아님) 둘 다 tsc 가 아니라
 schema.prisma 를 직접 읽어 잡았다. **등재됐다고 "검사됐다"로 읽으면 안 된다.**
 
-### [차단1] envelope provenance 이식 — **코드 완료, 발행 전**
+### [차단1] envelope provenance 이식 — ✅ **0.3.1 발행 완료 · 부채 청산**
 `cronozen-proof/packages/dpu-core`:
 `hash.ts` CHAIN_HASH_VERSION 신설 · `index.ts` export ·
 `envelope.ts` `legal_scope` 하드코딩 null 제거(키 미출력 방식) + `chain_hash_version`·
 `chain_timestamp`·`chain_content` 영속 · `adapter.ts` 3필드 선언(내부 포렌식 수치는 세척).
 - 타입검사 통과 · 테스트 **145/145** · 빌드 통과
 - **ops 소스 ↔ 새 빌드: 30벡터 전부 일치** (갈림 0)
-- ⏳ 남은 것 = **0.3.1 발행 → `--update` → known-divergence 3건 삭제**
+- ✅ `@cronozen/dpu-core@0.3.1` **발행**(`83b094b` · 태그 `dpu-core@0.3.1`)
+- ✅ ops 골든을 **발행본 0.3.1 로** 재생성 → `CHAIN_HASH_VERSION=v2` · `legal_scope=LS-TEST` ·
+  provenance 3필드 전부 확인
+- ✅ **known-divergence 3건 삭제** — 지금 예외 **0건**으로 초록이다(억제 없는 초록)
+- ✅ 결함주입 5/5 탐지 유지
+- ⏳ 남은 것 = **dataforge 핀 `0.3.0` → `0.3.1`**(정확 핀이라 발행만으로 안 옮겨간다) ·
+  `0.3.0` deprecate 여부 · proof 커밋·태그 **푸시**
 
 ---
 
